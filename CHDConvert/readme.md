@@ -1,7 +1,7 @@
 # 🧩 ROMs to CHD Conversion Script
 
 **File:** `/usr/local/bin/roms_to_chd.sh`  
-**Author:** Curt LeCaptain  
+**Author:** MotWakorb
 **Version:** 1.3  
 **License:** MIT (Personal/Home-Lab Use)
 
