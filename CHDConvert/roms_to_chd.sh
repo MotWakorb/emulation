@@ -12,11 +12,17 @@ DRYRUN="${DRYRUN:-0}"                        # 1 = print actions only (no extrac
 if command -v nproc >/dev/null 2>&1; then
   JOBS_DEFAULT="$(nproc)"; (( JOBS_DEFAULT>6 )) && JOBS_DEFAULT=6
 else
-  JOBS_DEFAULT=4
+  # macOS (Darwin) doesn't ship nproc; fall back to sysctl -n hw.ncpu
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    JOBS_DEFAULT="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+    if [[ "$JOBS_DEFAULT" -gt 6 ]]; then JOBS_DEFAULT=6; fi
+  else
+    JOBS_DEFAULT=4
+  fi
 fi
 JOBS="${JOBS:-$JOBS_DEFAULT}"
 CHECK_ONLY="${CHECK_ONLY:-0}"                # 1 = preflight then exit
-AUTO_INSTALL="${AUTO_INSTALL:-0}"            # 1 = attempt to install missing packages automatically (uses sudo)
+AUTO_INSTALL="${AUTO_INSTALL:-0}"            # 1 = attempt to install missing packages automatically (apt/dnf/yum/zypper/brew)
 
 # File-type mapping for chdman
 DVD_EXTS=("iso" "gcm")                       # PS2/Wii/GameCube
@@ -46,7 +52,7 @@ script_name() { basename "$0"; }
 print_help() {
   local name; name="$(script_name)"
   cat <<EOF
-${C_BOLD}${name}${C_RESET} — Convert ROM archives & images to CHD with parallelism, per-title logs, and cross-distro preflight.
+${C_BOLD}${name}${C_RESET} — Convert ROM archives & images to CHD with parallelism, per-title logs, and cross-platform preflight.
 
 ${C_BOLD}USAGE${C_RESET}
   ${name} [--help]
@@ -58,27 +64,27 @@ ${C_BOLD}ENVIRONMENT VARIABLES${C_RESET}
   ${C_BOLD}OUT_DIR${C_RESET}        If set, write CHDs under this path, mirroring ROM_DIR's structure
   ${C_BOLD}LOG_DIR${C_RESET}        Directory for per-title logs (default: \$ROM_DIR/.chd_logs)
   ${C_BOLD}DRYRUN${C_RESET}         1=preview (no extraction/convert/delete), 0=execute (default: 0)
-  ${C_BOLD}JOBS${C_RESET}           Parallel workers (default: min(nproc, 6))
+  ${C_BOLD}JOBS${C_RESET}           Parallel workers (default: min(nproc/hw.ncpu, 6))
   ${C_BOLD}CHECK_ONLY${C_RESET}     1=dependency check then exit (default: 0)
-  ${C_BOLD}AUTO_INSTALL${C_RESET}   1=attempt to install missing deps (apt/dnf/yum/zypper) (default: 0)
+  ${C_BOLD}AUTO_INSTALL${C_RESET}   1=attempt to install missing deps (apt/dnf/yum/zypper/brew) (default: 0)
   ${C_BOLD}SEVENZIP_BIN${C_RESET}   Force extractor: 7zz or 7z (auto-detected otherwise)
   ${C_BOLD}NO_COLOR${C_RESET}       If set, disables ANSI colors in output
 
 ${C_BOLD}EXAMPLES${C_RESET}
   # Check dependencies only (no conversion)
-  sudo CHECK_ONLY=1 ${name}
+  CHECK_ONLY=1 ${name}
 
-  # Auto-install missing deps (requires sudo) then exit
-  sudo AUTO_INSTALL=1 CHECK_ONLY=1 ${name}
+  # Auto-install missing deps (requires sudo on Linux)
+  AUTO_INSTALL=1 CHECK_ONLY=1 ${name}
 
   # Convert PS2 ROMs with 6 workers
-  sudo RECURSIVE=1 ROM_DIR="/path/to/roms/ps2" JOBS=6 ${name}
+  RECURSIVE=1 ROM_DIR="/path/to/roms/ps2" JOBS=6 ${name}
 
   # Convert whole library, write CHDs to a separate folder (mirror structure)
-  sudo RECURSIVE=1 ROM_DIR="/path/to/roms" OUT_DIR="/srv/chd" JOBS=6 ${name}
+  RECURSIVE=1 ROM_DIR="/path/to/roms" OUT_DIR="/srv/chd" JOBS=6 ${name}
 
   # Dry-run (no changes), log per-title to /var/log/chd
-  sudo DRYRUN=1 RECURSIVE=1 LOG_DIR="/var/log/chd" ROM_DIR="/path/to/roms" ${name}
+  DRYRUN=1 RECURSIVE=1 LOG_DIR="/var/log/chd" ROM_DIR="/path/to/roms" ${name}
 
 ${C_BOLD}SUPPORTED INPUTS${C_RESET}
   Archives: .7z, .zip
@@ -87,9 +93,9 @@ ${C_BOLD}SUPPORTED INPUTS${C_RESET}
   (Unsupported directly: .wbfs, .cso, .nkit — convert back to .iso first)
 
 ${C_BOLD}DEPENDENCIES${C_RESET}
-  7-Zip CLI (7zz or 7z): package ${C_BOLD}7zip${C_RESET} (or ${C_BOLD}p7zip-full/p7zip${C_RESET})
-  chdman: package ${C_BOLD}mame-tools${C_RESET} (or ${C_BOLD}mame${C_RESET})
-  ${C_DIM}The script auto-detects apt/dnf/yum/zypper and can auto-install when AUTO_INSTALL=1.${C_RESET}
+  7-Zip CLI (7zz or 7z): package ${C_BOLD}7zip${C_RESET} (or ${C_BOLD}p7zip/p7zip-full${C_RESET})
+  chdman: package ${C_BOLD}mame-tools${C_RESET} / ${C_BOLD}mame${C_RESET}
+  ${C_DIM}The script auto-detects apt/dnf/yum/zypper on Linux and brew on macOS; can auto-install when AUTO_INSTALL=1.${C_RESET}
 EOF
 }
 
@@ -99,7 +105,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   exit 0
 fi
 
-# ===== Package manager detection =====
+# ===== Package manager detection (Linux + macOS Homebrew) =====
 PKG_MGR=""
 PKG_INSTALL_CMD=""
 detect_pkg_mgr() {
@@ -115,6 +121,9 @@ detect_pkg_mgr() {
   elif command -v zypper >/dev/null 2>&1; then
     PKG_MGR="zypper"
     PKG_INSTALL_CMD="sudo zypper install -y"
+  elif command -v brew >/dev/null 2>&1; then
+    PKG_MGR="brew"
+    PKG_INSTALL_CMD="brew install"
   else
     PKG_MGR="unknown"
   fi
@@ -126,6 +135,8 @@ have_pkg() {
       dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -q "install ok installed" ;;
     dnf|yum|zypper)
       rpm -q "$1" >/dev/null 2>&1 ;;
+    brew)
+      brew list --versions "$1" >/dev/null 2>&1 ;;
     *)
       return 1 ;;
   esac
@@ -134,15 +145,22 @@ have_pkg() {
 try_auto_install() {
   # $@: package names
   if (( AUTO_INSTALL )) && [[ -n "$PKG_INSTALL_CMD" ]]; then
-    log "Attempting automatic install: $*"
-    # shellcheck disable=SC2086
-    eval "$PKG_INSTALL_CMD $*"
+    log "Attempting automatic install (${PKG_MGR}): $*"
+    if [[ "$PKG_MGR" == "brew" ]]; then
+      # brew does not use sudo and may have different package names; try sequentially
+      for p in "$@"; do
+        brew list --versions "$p" >/dev/null 2>&1 || brew install "$p" || true
+      done
+    else
+      # shellcheck disable=SC2086
+      eval "$PKG_INSTALL_CMD $*"
+    fi
   else
     return 1
   fi
 }
 
-# ===== Preflight (multi-distro) =====
+# ===== Preflight (multi-distro + macOS) =====
 SEVENZIP_BIN="${SEVENZIP_BIN:-}"             # Will be set to 7zz or 7z
 
 preflight() {
@@ -174,6 +192,9 @@ preflight() {
       dnf|yum|zypper)
         have_pkg 7zip   || need_pkgs+=("7zip")
         have_pkg p7zip  || alt_pkgs+=("p7zip") ;;
+      brew)
+        have_pkg 7zip  || need_pkgs+=("7zip")
+        have_pkg p7zip || alt_pkgs+=("p7zip") ;;
     esac
   fi
 
@@ -186,8 +207,11 @@ preflight() {
         fi ;;
       dnf|yum|zypper)
         if ! have_pkg mame-tools && ! have_pkg mame; then
-          need_pkgs+=("mame-tools")
-          alt_pkgs+=("mame")
+          need_pkgs+=("mame-tools"); alt_pkgs+=("mame")
+        fi ;;
+      brew)
+        if ! have_pkg mame; then
+          need_pkgs+=("mame")
         fi ;;
     esac
   fi
@@ -216,6 +240,7 @@ preflight() {
       dnf)    printf "Install: sudo dnf install 7zip   # or: sudo dnf install p7zip\n" ;;
       yum)    printf "Install: sudo yum install 7zip   # or: sudo yum install p7zip\n" ;;
       zypper) printf "Install: sudo zypper install 7zip   # or: sudo zypper install p7zip\n" ;;
+      brew)   printf "Install: brew install 7zip   # or: brew install p7zip\n" ;;
       *)      printf "Please install 7-Zip CLI (7zz/7z) via your package manager.\n" ;;
     esac
     missing=1
@@ -228,6 +253,7 @@ preflight() {
       dnf)    printf "Install: sudo dnf install mame-tools   # or: sudo dnf install mame\n" ;;
       yum)    printf "Install: sudo yum install mame-tools   # or: sudo yum install mame\n" ;;
       zypper) printf "Install: sudo zypper install mame-tools   # or: sudo zypper install mame\n" ;;
+      brew)   printf "Install: brew install mame\n" ;;
       *)      printf "Please install chdman via your package manager (package: mame-tools or mame).\n" ;;
     esac
     missing=1

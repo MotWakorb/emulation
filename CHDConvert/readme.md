@@ -1,7 +1,7 @@
 # 🧩 ROMs to CHD Conversion Script
 
 **File:** `/usr/local/bin/roms_to_chd.sh`  
-**Author:** MotWakorb
+**Author:** Project Maintainer  
 **Version:** 1.3  
 **License:** MIT (Personal/Home-Lab Use)
 
@@ -160,7 +160,6 @@ No warranty expressed or implied.
 
 ```
 Copyright © 2025
-MotWakorb
 ```
 
 Happy archiving and preservation! 🎮
@@ -206,7 +205,7 @@ You can install this script directly from your Git repository for easy updates.
 
 ```bash
 # Clone repository (example)
-git clone https://github.com/MotWakorb/roms-to-chd.git
+git clone https://github.com/<yourname>/roms-to-chd.git
 cd roms-to-chd
 
 # Install script system-wide
@@ -226,3 +225,81 @@ roms_to_chd.sh --help
 ```
 
 ---
+
+
+---
+
+## 🍏 macOS (Homebrew) Notes
+
+This script supports macOS using **Homebrew**.
+
+- 7-Zip CLI: `brew install 7zip` (or `brew install p7zip`)
+- chdman (via MAME): `brew install mame`
+
+Preflight will auto-detect `brew`. To auto-install dependencies:
+```bash
+AUTO_INSTALL=1 CHECK_ONLY=1 roms_to_chd.sh
+```
+
+
+
+---
+
+## 🍺 Installing Homebrew (macOS)
+
+If you don't already have Homebrew installed, you can set it up with:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Then verify it's working:
+
+```bash
+brew doctor
+brew update
+```
+
+Once Homebrew is ready, install the dependencies for this script:
+
+```bash
+brew install 7zip
+brew install mame
+```
+
+After that, you're all set to run the script on macOS! 🎮
+
+---
+
+## 🪟 Windows (PowerShell) Version
+
+A full-featured PowerShell port is included for Windows users.
+
+- Script: `roms_to_chd.ps1` (PowerShell 7+ recommended, Windows PowerShell supported)
+- Installer: `install_windows.ps1` (adds the tool to your PATH)
+
+### Quick install (per-user, no admin)
+```powershell
+# In the folder containing install_windows.ps1 and roms_to_chd.ps1
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\install_windows.ps1
+# Open a new terminal, then:
+roms_to_chd --help
+```
+
+### System-wide install (Admin)
+```powershell
+Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File .\install_windows.ps1 -SystemWide'
+```
+
+### Manual usage without installer
+```powershell
+# Check dependencies
+.
+oms_to_chd.ps1 -CheckOnly
+
+# Convert recursively with 6 workers
+.
+oms_to_chd.ps1 -RomDir 'D:\Roms\ps2' -Recursive -Jobs 6
+```
+
