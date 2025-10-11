@@ -160,7 +160,7 @@ No warranty expressed or implied.
 
 ```
 Copyright © 2025
-Curt LeCaptain
+MotWakorb
 ```
 
 Happy archiving and preservation! 🎮
