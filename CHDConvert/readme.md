@@ -2,7 +2,7 @@
 
 **File:** `/usr/local/bin/roms_to_chd.sh`  
 **Author:** Curt LeCaptain  
-**Version:** 1.0  
+**Version:** 1.3  
 **License:** MIT (Personal/Home-Lab Use)
 
 ---
@@ -11,52 +11,34 @@
 
 This script automates conversion of ROM archives and disc images into modern **CHD (Compressed Hard Disk Image)** format — the standard for many emulation systems (PS1/PS2, GameCube, Dreamcast, etc).
 
-It performs:
-
-- 🗜️ Extraction of `.7z` / `.zip` archives  
-- 💿 Conversion of `.iso`, `.cue`, `.gdi`, `.gcm`, `.toc` images → `.chd`  
-- 🧹 Automatic cleanup of verified source files  
-- ⚙️ Parallel processing for multi-core systems  
-- ✅ Dependency preflight (apt-based validation)
+**What’s new:**  
+- 🎨 **Colored output** (TTY-aware; honors `NO_COLOR`).  
+- 📝 **Per-title logs** in a dedicated logs directory.  
+- 🗂️ Optional `OUT_DIR` to mirror ROM structure elsewhere.  
+- 🧪 `DRYRUN=1` to preview actions.  
+- 🧰 Cross-distro preflight for **Debian/Ubuntu** and **RPM-based** distros, with optional auto-install.
 
 ---
 
 ## 🧰 Requirements
 
-> 🟢 **Note:** This script is designed for Debian-based Linux distributions (Ubuntu, Debian, Mint, etc.).
+Debian-based and RPM-based distributions are supported.
 
-| Tool | Package | Description |
-|------|----------|-------------|
-| 7zz | 7zip | Official 7-Zip CLI |
-| 7z | p7zip-full | Alternative extractor |
-| chdman | mame-tools | Converts ISO/CUE → CHD |
-
-The script checks these automatically and prints install commands if any are missing.
+| Purpose | Debian/Ubuntu Package(s) | RPM Package(s) (Fedora/RHEL/Alma/Rocky/CentOS/openSUSE) |
+|--------|---------------------------|----------------------------------------------------------|
+| 7-Zip CLI | `7zip` *(preferred)* or `p7zip-full` | `7zip` *(preferred)* or `p7zip` |
+| chdman | `mame-tools` *(or `mame`)* | `mame-tools` *(or `mame`)* |
 
 ---
 
 ## 🧪 Preflight Check (Dependencies Only)
 
-Run this first to ensure all tools are available:
-
 ```bash
+# Show what’s missing (no conversions)
 sudo CHECK_ONLY=1 /usr/local/bin/roms_to_chd.sh
-```
 
-**Example output:**
-```
-[2025-10-11 16:20:10] Preflight OK: using 7zz and chdman.
-CHECK_ONLY=1 set; exiting after preflight.
-```
-
-If anything’s missing:
-```
-Missing requirements detected:
-  - 7zip
-  - mame-tools
-
-Install with:
-  sudo apt update && sudo apt install 7zip mame-tools
+# Optionally auto-install (uses apt/dnf/yum/zypper)
+sudo AUTO_INSTALL=1 CHECK_ONLY=1 /usr/local/bin/roms_to_chd.sh
 ```
 
 ---
@@ -67,30 +49,36 @@ Install with:
 |-----------|----------|-------------|
 | `ROM_DIR` | `/path/to/roms` | Root directory containing ROMs |
 | `RECURSIVE` | `0` | Set `1` to scan subfolders recursively |
+| `OUT_DIR` | *(empty)* | If set, CHDs are written here, mirroring `ROM_DIR` structure |
+| `LOG_DIR` | `$ROM_DIR/.chd_logs` | Per-title logs are written here |
+| `DRYRUN` | `0` | If `1`, prints actions without extracting/converting/deleting |
 | `JOBS` | `min(nproc, 6)` | Number of parallel conversions |
-| `CHECK_ONLY` | `0` | Run only dependency check |
+| `CHECK_ONLY` | `0` | Run only dependency check then exit |
+| `AUTO_INSTALL` | `0` | If `1`, attempt apt/dnf/yum/zypper installs |
 | `SEVENZIP_BIN` | auto | Force use of `7zz` or `7z` manually |
+| `NO_COLOR` | unset | If set, disables colored output |
 
 ---
 
 ## 🚀 Usage Examples
 
-### PlayStation 2
+### Convert PS2 ROMs with per-title logs
 ```bash
 sudo RECURSIVE=1 ROM_DIR="/path/to/roms/ps2" JOBS=6 /usr/local/bin/roms_to_chd.sh
+# Logs: /path/to/roms/ps2/.chd_logs/<Game_Title>.log
 ```
 
-### GameCube
+### Convert to a separate OUT_DIR (mirrors structure)
 ```bash
-sudo RECURSIVE=1 ROM_DIR="/path/to/roms/gamecube" JOBS=6 /usr/local/bin/roms_to_chd.sh
+sudo RECURSIVE=1 ROM_DIR="/path/to/roms" OUT_DIR="/srv/chd" JOBS=6 /usr/local/bin/roms_to_chd.sh
+# Example: /path/to/roms/ps2/Foo/Foo.iso -> /srv/chd/ps2/Foo/Foo.chd
+# Logs (by default): /path/to/roms/.chd_logs
 ```
 
-### All Systems
+### Dry-Run (no changes) with custom LOG_DIR
 ```bash
-sudo RECURSIVE=1 ROM_DIR="/path/to/roms" JOBS=6 /usr/local/bin/roms_to_chd.sh
+sudo DRYRUN=1 RECURSIVE=1 LOG_DIR="/var/log/chd" ROM_DIR="/path/to/roms" /usr/local/bin/roms_to_chd.sh
 ```
-
-> 💡 Tip: Use `JOBS=$(nproc)` for max speed on fast SSDs.
 
 ---
 
@@ -102,17 +90,30 @@ sudo RECURSIVE=1 ROM_DIR="/path/to/roms" JOBS=6 /usr/local/bin/roms_to_chd.sh
 | CD | `chdman createcd` | `.cue`, `.gdi`, `.toc` |
 | Archives | extracted & converted | `.7z`, `.zip` |
 
-Unsupported: `.wbfs`, `.cso`, `.nkit` (convert back to `.iso` first).
+Unsupported: `.wbfs`, `.cso`, `.nkit` (convert these back to `.iso` first).
+
+---
+
+## 📄 Per-Title Logs
+
+For each title (archive or loose image), the script writes a log file that includes:
+- Extraction command + output
+- Conversion command + output
+- Any cleanup actions (source deletions)
+- Errors or skips
+
+**Default location:** `$ROM_DIR/.chd_logs`  
+**Customize:** set `LOG_DIR="/path/to/logs"`
 
 ---
 
 ## 🧱 Example Output
 ```
 [2025-10-11 16:20:10] Preflight OK: using 7zz and chdman.
+[2025-10-11 16:20:10] Per-title logs -> /path/to/roms/.chd_logs
 [2025-10-11 16:20:10] Starting ROMs -> CHD in: /path/to/roms/ps2 (JOBS=6, RECURSIVE=1)
-[2025-10-11 16:20:10] Archives found: 134
 [2025-10-11 16:20:11] Extracting: Tekken 5 (USA).7z
-[2025-10-11 16:20:42] Converting: Tekken 5 (USA) → Tekken 5 (USA).chd
+[2025-10-11 16:20:42] Converting (DVD) Tekken 5 (USA) -> Tekken 5 (USA).chd
 [2025-10-11 16:21:05] Success: Tekken 5 (USA).chd created. Cleaning archive.
 [2025-10-11 16:21:05] Done.
 ```
@@ -124,6 +125,7 @@ Unsupported: `.wbfs`, `.cso`, `.nkit` (convert back to `.iso` first).
 - ✅ Only deletes source files if the `.chd` exists and is non-empty  
 - 🔒 Creates isolated temporary folders per game  
 - 🧩 Handles spaces, quotes, and symbols safely  
+- 🧪 DRYRUN mode avoids any file changes
 
 ---
 
@@ -132,7 +134,7 @@ Unsupported: `.wbfs`, `.cso`, `.nkit` (convert back to `.iso` first).
 | Problem | Fix |
 |----------|-----|
 | `Extraction failed:` | Corrupt or unsupported 7z — test manually with `7zz x file.7z` |
-| `command not found` | Install missing `7zip` or `mame-tools` |
+| `command not found` | Install missing `7zip`/`p7zip` or `mame-tools`/`mame` |
 | `No archives found` | Check `ROM_DIR` and use `RECURSIVE=1` if needed |
 | `Permission denied` | Run with `sudo` |
 | `CHD not created` | Ensure extracted files contain a valid `.iso` or `.cue` |
@@ -144,23 +146,16 @@ Unsupported: `.wbfs`, `.cso`, `.nkit` (convert back to `.iso` first).
 | Step | Command |
 |------|----------|
 | 1️⃣ Check requirements | `sudo CHECK_ONLY=1 /usr/local/bin/roms_to_chd.sh` |
-| 2️⃣ Convert PS2 ROMs | `sudo RECURSIVE=1 ROM_DIR="/path/to/roms/ps2" JOBS=6 /usr/local/bin/roms_to_chd.sh` |
-| 3️⃣ Monitor | Watch terminal for `Converting` / `Success` |
-| 4️⃣ Verify | `.chd` files appear beside sources |
-
----
-
-## 🧮 Advanced Notes
-
-- Parallelism: Uses `xargs -P` — stable and efficient.  
-- Planned: `DRYRUN=1` and `OUT_DIR` support.  
-- Extend: Modify `DVD_EXTS` / `CD_EXTS` arrays to support new systems.
+| 2️⃣ (Optional) Auto-install | `sudo AUTO_INSTALL=1 CHECK_ONLY=1 /usr/local/bin/roms_to_chd.sh` |
+| 3️⃣ Convert PS2 ROMs | `sudo RECURSIVE=1 ROM_DIR="/path/to/roms/ps2" JOBS=6 /usr/local/bin/roms_to_chd.sh` |
+| 4️⃣ Write to OUT_DIR | `sudo OUT_DIR="/srv/chd" RECURSIVE=1 ROM_DIR="/path/to/roms" /usr/local/bin/roms_to_chd.sh` |
+| 5️⃣ Preview (no changes) | `sudo DRYRUN=1 RECURSIVE=1 ROM_DIR="/path/to/roms" /usr/local/bin/roms_to_chd.sh` |
 
 ---
 
 ## 📜 License & Attribution
 
-This script and documentation are provided **as-is** for personal or home-lab use.  
+This script and documentation are provided **as-is** for personal/home-lab use.  
 No warranty expressed or implied.
 
 ```
@@ -169,3 +164,65 @@ Curt LeCaptain
 ```
 
 Happy archiving and preservation! 🎮
+
+
+---
+
+
+---
+
+## 🆘 Usage (`--help`)
+
+```text
+roms_to_chd.sh — Convert ROM archives & images to CHD with parallelism, per-title logs, and cross-distro preflight.
+
+USAGE
+  roms_to_chd.sh [--help]
+  # Configuration is via environment variables.
+
+ENV VARS
+  ROM_DIR        Root directory containing ROMs (default: /path/to/roms)
+  RECURSIVE      0=only ROM_DIR, 1=recurse subfolders (default: 0)
+  OUT_DIR        If set, write CHDs under this path, mirroring ROM_DIR's structure
+  LOG_DIR        Directory for per-title logs (default: $ROM_DIR/.chd_logs)
+  DRYRUN         1=preview (no extraction/convert/delete), 0=execute (default: 0)
+  JOBS           Parallel workers (default: min(nproc, 6))
+  CHECK_ONLY     1=dependency check then exit (default: 0)
+  AUTO_INSTALL   1=attempt to install missing deps (apt/dnf/yum/zypper) (default: 0)
+  SEVENZIP_BIN   Force extractor: 7zz or 7z (auto-detected otherwise)
+  NO_COLOR       If set, disables ANSI colors in output
+
+EXAMPLES
+  sudo CHECK_ONLY=1 roms_to_chd.sh
+  sudo AUTO_INSTALL=1 CHECK_ONLY=1 roms_to_chd.sh
+  sudo RECURSIVE=1 ROM_DIR="/path/to/roms/ps2" JOBS=6 roms_to_chd.sh
+  sudo RECURSIVE=1 ROM_DIR="/path/to/roms" OUT_DIR="/srv/chd" JOBS=6 roms_to_chd.sh
+  sudo DRYRUN=1 RECURSIVE=1 LOG_DIR="/var/log/chd" ROM_DIR="/path/to/roms" roms_to_chd.sh
+```
+
+## 💻 Installation via Git Clone
+
+You can install this script directly from your Git repository for easy updates.
+
+```bash
+# Clone repository (example)
+git clone https://github.com/<yourname>/roms-to-chd.git
+cd roms-to-chd
+
+# Install script system-wide
+sudo install -m 0755 roms_to_chd.sh /usr/local/bin/roms_to_chd.sh
+sudo install -m 0644 README.md /usr/local/share/docs/roms_to_chd/README.md
+
+# Verify installation and options
+roms_to_chd.sh --help
+```
+
+### 🆘 Built-in Help
+
+You can display usage information and environment variables at any time:
+
+```bash
+roms_to_chd.sh --help
+```
+
+---
