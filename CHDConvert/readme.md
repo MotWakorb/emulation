@@ -206,7 +206,7 @@ You can install this script directly from your Git repository for easy updates.
 
 ```bash
 # Clone repository (example)
-git clone https://github.com/<yourname>/roms-to-chd.git
+git clone https://github.com/MotWakorb/roms-to-chd.git
 cd roms-to-chd
 
 # Install script system-wide
