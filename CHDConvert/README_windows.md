@@ -1,26 +1,15 @@
-<a name="top"></a>
+# 🪟 ROMs to CHD Converter (Windows / PowerShell)
 
-# 🧩 ROMs to CHD Conversion Script (Windows PowerShell Edition)
+_Version 1.2.0 — PowerShell edition (synced with roms_to_chd.ps1)_
 
-**File:** `roms_to_chd.ps1`  
-**Installer:** `install_windows.ps1`  
-**Version:** 1.0  
-**License:** MIT (Personal/Home-Lab Use)  
-**Tested On:** Windows 10, Windows 11, PowerShell 5.1+, PowerShell 7+
+Convert ROM archives and disc images into **CHD format** on Windows with PowerShell — includes per-title logs, parallel processing, and auto-dependency validation.
 
 ---
 
 ## 🎯 Overview
 
-This PowerShell-based script automates the conversion of ROM archives and image files into **CHD (Compressed Hard Disk Image)** format — the standard for emulators like PCSX2, Dolphin, and RetroArch.
-
-**Core Features:**
-- 🗜️ Extract `.7z` / `.zip` archives using 7-Zip CLI  
-- 💿 Convert `.iso`, `.cue`, `.gdi`, `.gcm`, `.toc` → `.chd` via `chdman`  
-- ⚙️ Multi-threaded conversion using PowerShell Jobs or Parallel ForEach  
-- 🧹 Cleans up verified source files safely  
-- 🧾 Per-title logging with detailed extraction/conversion output  
-- ✅ Dependency checks with optional auto-install via `winget` or `choco`
+This PowerShell edition automates conversion of ROM archives and disc images (`.7z`, `.zip`, `.cue`, `.iso`, `.gdi`, `.toc`, `.gcm`) into **CHD format** using `chdman`.  
+It runs natively on Windows, supports parallel execution, safe cleanup, and automatic dependency verification (with `winget` or `choco`).
 
 [↑ Back to top](#top)
 
@@ -28,67 +17,59 @@ This PowerShell-based script automates the conversion of ROM archives and image 
 
 ## 🧰 Requirements
 
-| Tool | Install (winget) | Install (choco) | Description |
-|------|------------------|-----------------|-------------|
-| 7-Zip CLI | `winget install 7zip.7zip` | `choco install 7zip` | Extraction of `.7z` / `.zip` |
-| MAME (chdman.exe) | `winget install MAMEDev.MAME` | `choco install mame` | CHD creation utility |
-| PowerShell 7+ | [https://aka.ms/powershell](https://aka.ms/powershell) | — | Enables parallel processing |
-
-Check dependencies manually:
-```powershell
-.oms_to_chd.ps1 -CheckOnly
-```
-
-Auto-install missing ones:
-```powershell
-.oms_to_chd.ps1 -AutoInstall -CheckOnly
-```
-
-[↑ Back to top](#top)
+| Component | Description |
+|------------|--------------|
+| `7-Zip` | CLI version (must be in PATH) |
+| `chdman.exe` | From MAME or mame-tools |
+| PowerShell 7+ | Recommended for full compatibility |
+| Windows Package Manager | `winget` or Chocolatey (`choco`) |
 
 ---
 
-## ⚙️ Parameters and Environment Variables
+## ⚙️ Parameters
 
-| Parameter | Default | Description |
-|------------|----------|-------------|
-| `-RomDir` | `C:\path\to\roms` | Root directory containing ROMs |
-| `-Recursive` | `$false` | Scan subfolders recursively |
-| `-Jobs` | `min(ProcessorCount, 6)` | Number of concurrent jobs |
-| `-OutDir` | *(none)* | Write CHDs to a different directory |
-| `-LogDir` | `$RomDir\.chd_logs` | Log directory for per-title logs |
-| `-DryRun` | `$false` | Show actions without modifying files |
-| `-CheckOnly` | `$false` | Dependency check only |
-| `-AutoInstall` | `$false` | Use `winget`/`choco` to install missing tools |
+> ℹ️ **Linux/macOS users:** The Bash edition now uses CLI flags only (no environment variables). See the Linux/macOS README for the flag list.
 
-All parameters can be set as environment variables, e.g.:  
-```powershell
-$env:ROM_DIR = 'D:\Roms\PS2'
-$env:JOBS = 6
-.oms_to_chd.ps1
-```
-
-[↑ Back to top](#top)
+| Parameter | Description |
+|-----------|-------------|
+| `-RomDir` | **Required.** Root directory containing ROMs |
+| `-Recursive` | Recurse into subfolders |
+| `-OutDir` | Destination directory for CHDs (mirrors ROM dir structure) |
+| `-LogDir` | Directory for per-title logs (default: `<RomDir>\.chd_logs`) |
+| `-Jobs` | Number of parallel workers (default: auto-detect CPU cores) |
+| `-DryRun` | Preview actions only; no extraction or conversion |
+| `-AutoInstall` | Install missing dependencies (requires `winget` or `choco`) |
+| `-CheckOnly` | Only check dependencies, do not convert |
+| `-Help` | Show help information |
 
 ---
 
 ## 🚀 Usage Examples
 
+### Quick Examples
+
 ```powershell
-# Check dependencies
-.oms_to_chd.ps1 -CheckOnly
+# Dependency check
+.oms_to_chd.ps1 -RomDir "D:\Roms" -CheckOnly
 
 # Convert PS2 ROMs recursively
-.oms_to_chd.ps1 -RomDir 'D:\Roms\PS2' -Recursive -Jobs 6
+.oms_to_chd.ps1 -RomDir "D:\Roms\PS2" -Recursive -Jobs 6
 
-# Convert entire library to another drive
-.oms_to_chd.ps1 -RomDir 'D:\Roms' -OutDir 'E:\CHD' -Recursive
+# Write CHDs to a different drive
+.oms_to_chd.ps1 -RomDir "D:\Roms" -OutDir "E:\CHD" -Recursive -Jobs 6
 
-# Dry-run mode (no changes)
-.oms_to_chd.ps1 -DryRun -RomDir 'D:\Roms' -Recursive
+# Dry-run mode (no conversion)
+.oms_to_chd.ps1 -RomDir "D:\Roms" -Recursive -DryRun
+```
 
-# Custom logs folder
-.oms_to_chd.ps1 -RomDir 'D:\Roms' -LogDir 'D:\Logs\CHD' -Recursive
+### Advanced
+
+```powershell
+# Preflight with auto-install (using winget or choco)
+.oms_to_chd.ps1 -RomDir "D:\Roms" -CheckOnly -AutoInstall
+
+# Full conversion with custom logs path
+.oms_to_chd.ps1 -RomDir "D:\Roms" -Recursive -Jobs 8 -LogDir "D:\Logs\CHD"
 ```
 
 [↑ Back to top](#top)
@@ -97,85 +78,43 @@ $env:JOBS = 6
 
 ## 🧩 Supported Formats
 
-| Type | Command | Example Extensions |
-|------|----------|--------------------|
-| DVD | `chdman createdvd` | `.iso`, `.gcm` |
-| CD | `chdman createcd` | `.cue`, `.gdi`, `.toc` |
-| Archives | Extract & convert | `.7z`, `.zip` |
+| Category | Extensions |
+|-----------|-------------|
+| **Archives** | `.7z`, `.zip` |
+| **CD-Based** | `.cue`, `.gdi`, `.toc` |
+| **DVD-Based** | `.iso`, `.gcm` |
+| **Unsupported (must convert manually)** | `.wbfs`, `.cso`, `.nkit` |
 
-Unsupported: `.wbfs`, `.cso`, `.nkit` — convert to `.iso` first.
+---
 
-[↑ Back to top](#top)
+## 🧹 Safety Features
+
+- Keeps original files if CHD creation fails  
+- Generates detailed per-title logs  
+- Automatically validates `7z` and `chdman` presence  
+- Supports preview mode (`-DryRun`) for safety
 
 ---
 
 ## 🧾 Troubleshooting
 
-| Problem | Fix |
-|----------|-----|
-| `Extraction failed:` | Check archive manually with `7zz x file.7z` |
-| `command not found` | Install missing tools or add to PATH |
-| `CHD not created` | Verify extracted image format |
-| `Permission denied` | Run PowerShell as Administrator |
-| `No archives found` | Add `-Recursive` for subfolders |
+- **Missing 7-Zip:** Install via `winget install 7zip.7zip` or `choco install 7zip`
+- **Missing chdman:** Install MAME or MAME tools (`winget install MAMEDev.MAME`)
+- **Permission issues:** Run PowerShell as Administrator
+- **Parallel jobs not working:** Ensure PowerShell 7+ (Core) is in use
 
 [↑ Back to top](#top)
 
 ---
 
-## 🪟 Installation via Installer Script
+## 🐧 Linux/macOS Version
 
-### Per-User Install (No Admin)
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\install_windows.ps1
-roms_to_chd --help
-```
-
-### System-Wide Install (Admin)
-```powershell
-Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File .\install_windows.ps1 -SystemWide'
-```
-
-### Uninstall
-```powershell
-.\install_windows.ps1 -Uninstall
-```
-
-[↑ Back to top](#top)
-
----
-
-## 💾 Features & Notes
-
-- **Parallelism:** Uses `ForEach-Object -Parallel` in PowerShell 7+; `Start-Job` fallback on older shells.  
-- **DRYRUN Mode:** Simulate conversion steps safely.  
-- **OUT_DIR:** Mirrors folder structure from ROM source.  
-- **Logging:** One log per game, saved under `$LogDir`.  
-- **Safe Cleanup:** Deletes only when `.chd` verified.  
-
-[↑ Back to top](#top)
-
----
-
-## 📦 Packaging and Cross-Platform Links
-
-- Linux/macOS version: [README.md](README.md)  
-- Windows installer: `install_windows.ps1`  
-- Packaging templates: `pkg/chocolatey/` and `pkg/winget/`
-
-[↑ Back to top](#top)
+Prefer Bash? See the cross-platform version here:  
+👉 [README.md](./README.md)
 
 ---
 
 ## 📜 License & Attribution
 
-This script and documentation are provided **as-is** for personal or home-lab use.  
-No warranty expressed or implied.
-
-```
-Copyright © 2025
-Project Maintainer
-```
-
-[↑ Back to top](#top)
+MIT License © 2025  
+Created for Windows-based CHD conversion workflows in PowerShell.

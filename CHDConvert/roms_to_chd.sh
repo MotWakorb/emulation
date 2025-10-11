@@ -1,574 +1,323 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2155
 set -euo pipefail
 
-# ===== Config =====
-# Override at runtime: ROM_DIR="/some/path" RECURSIVE=1 JOBS=6 ./roms_to_chd.sh
-ROM_DIR="${ROM_DIR:-/path/to/roms}"
-RECURSIVE="${RECURSIVE:-0}"                  # 0 = only this dir, 1 = recurse subdirs
-OUT_DIR="${OUT_DIR:-}"                       # If set, write CHDs under this root, mirroring ROM_DIR structure
-LOG_DIR="${LOG_DIR:-}"                       # If empty, defaults to "$ROM_DIR/.chd_logs"
-DRYRUN="${DRYRUN:-0}"                        # 1 = print actions only (no extraction/convert/delete)
+# =========================
+# Flag-only CLI (no env vars)
+# =========================
+ROM_DIR=""
+RECURSIVE=0
+OUT_DIR=""
+LOG_DIR=""
+DRYRUN=0
+CHECK_ONLY=0
+AUTO_INSTALL=0
+SEVENZIP_BIN=""
+# Jobs default: min(cores,6)
 if command -v nproc >/dev/null 2>&1; then
-  JOBS_DEFAULT="$(nproc)"; (( JOBS_DEFAULT>6 )) && JOBS_DEFAULT=6
+  _J="$(nproc)"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  _J="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 else
-  # macOS (Darwin) doesn't ship nproc; fall back to sysctl -n hw.ncpu
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    JOBS_DEFAULT="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-    if [[ "$JOBS_DEFAULT" -gt 6 ]]; then JOBS_DEFAULT=6; fi
-  else
-    JOBS_DEFAULT=4
-  fi
+  _J=4
 fi
-JOBS="${JOBS:-$JOBS_DEFAULT}"
-CHECK_ONLY="${CHECK_ONLY:-0}"                # 1 = preflight then exit
-AUTO_INSTALL="${AUTO_INSTALL:-0}"            # 1 = attempt to install missing packages automatically (apt/dnf/yum/zypper/brew)
+JOBS="$(( _J>6 ? 6 : _J ))"
 
-# File-type mapping for chdman
-DVD_EXTS=("iso" "gcm")                       # PS2/Wii/GameCube
-CD_EXTS=("cue" "gdi" "toc")                  # PS1/PS2 CD, Dreamcast, etc.
-
-# ===== Colors (TTY-aware; respect NO_COLOR) =====
+# ------------- Colors (TTY-aware, respects NO_COLOR) -------------
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-  C_RESET=$'\033[0m'
-  C_INFO=$'\033[1;36m'     # cyan
-  C_WARN=$'\033[1;33m'     # yellow
-  C_ERR=$'\033[1;31m'      # red
-  C_OK=$'\033[1;32m'       # green
-  C_BOLD=$'\033[1m'
-  C_DIM=$'\033[2m'
+  B=$'\033[1m'; C_OK=$'\033[1;32m'; C_INFO=$'\033[1;36m'; C_WARN=$'\033[1;33m'; C_ERR=$'\033[1;31m'; Z=$'\033[0m'
 else
-  C_RESET=""; C_INFO=""; C_WARN=""; C_ERR=""; C_OK=""; C_BOLD=""; C_DIM="";
+  B=; C_OK=; C_INFO=; C_WARN=; C_ERR=; Z=
 fi
+ts()   { date '+%F %T'; }
+log()  { printf '[%s] %s%s%s\n' "$(ts)" "$C_INFO" "$*" "$Z"; }
+ok()   { printf '[%s] %s%s%s\n' "$(ts)" "$C_OK"  "$*" "$Z"; }
+warn() { printf '[%s] %s%s%s\n' "$(ts)" "$C_WARN" "$*" "$Z"; }
+err()  { printf '[%s] %s%s%s\n' "$(ts)" "$C_ERR" "$*" "$Z" >&2; }
 
-timestamp() { date '+%F %T'; }
-log()      { printf '[%s] %s%s%s\n' "$(timestamp)" "${C_INFO}" "$*" "${C_RESET}"; }
-warn()     { printf '[%s] %s%s%s\n' "$(timestamp)" "${C_WARN}" "$*" "${C_RESET}"; }
-ok()       { printf '[%s] %s%s%s\n' "$(timestamp)" "${C_OK}"  "$*" "${C_RESET}"; }
-err()      { printf '[%s] %s%s%s\n' "$(timestamp)" "${C_ERR}" "$*" "${C_RESET}" >&2; }
+print_usage() {
+  cat <<'EOF'
+roms_to_chd.sh — Convert ROM archives & images to CHD (parallel, per-title logs, auto-preflight)
 
-script_name() { basename "$0"; }
+USAGE
+  roms_to_chd.sh [options]
 
-print_help() {
-  local name; name="$(script_name)"
-  cat <<EOF
-${C_BOLD}${name}${C_RESET} — Convert ROM archives & images to CHD with parallelism, per-title logs, and cross-platform preflight.
+REQUIRED
+  -d, --rom-dir DIR        Root directory containing ROMs
 
-${C_BOLD}USAGE${C_RESET}
-  ${name} [--help]
-  # Configuration is via environment variables (examples below).
+OPTIONS
+  -r, --recursive          Recurse into subfolders (default: off)
+  -o, --out-dir DIR        Write CHDs under this directory (mirrors rom-dir structure)
+  -l, --log-dir DIR        Per-title logs directory (default: <rom-dir>/.chd_logs)
+  -j, --jobs N             Parallel workers (default: min(cpu,6))
+  -n, --dry-run            Preview actions; no extraction/convert/delete
+  -a, --auto-install       Try to install missing deps (apt/dnf/yum/zypper/brew)
+  -c, --check-only         Only check dependencies and exit
+      --7z BIN             Force extractor (7zz or 7z)
+  -h, --help               Show this help
 
-${C_BOLD}ENVIRONMENT VARIABLES${C_RESET}
-  ${C_BOLD}ROM_DIR${C_RESET}        Root directory containing ROMs (default: /path/to/roms)
-  ${C_BOLD}RECURSIVE${C_RESET}      0=only ROM_DIR, 1=recurse into subfolders (default: 0)
-  ${C_BOLD}OUT_DIR${C_RESET}        If set, write CHDs under this path, mirroring ROM_DIR's structure
-  ${C_BOLD}LOG_DIR${C_RESET}        Directory for per-title logs (default: \$ROM_DIR/.chd_logs)
-  ${C_BOLD}DRYRUN${C_RESET}         1=preview (no extraction/convert/delete), 0=execute (default: 0)
-  ${C_BOLD}JOBS${C_RESET}           Parallel workers (default: min(nproc/hw.ncpu, 6))
-  ${C_BOLD}CHECK_ONLY${C_RESET}     1=dependency check then exit (default: 0)
-  ${C_BOLD}AUTO_INSTALL${C_RESET}   1=attempt to install missing deps (apt/dnf/yum/zypper/brew) (default: 0)
-  ${C_BOLD}SEVENZIP_BIN${C_RESET}   Force extractor: 7zz or 7z (auto-detected otherwise)
-  ${C_BOLD}NO_COLOR${C_RESET}       If set, disables ANSI colors in output
-
-${C_BOLD}EXAMPLES${C_RESET}
-  # Check dependencies only (no conversion)
-  CHECK_ONLY=1 ${name}
-
-  # Auto-install missing deps (requires sudo on Linux)
-  AUTO_INSTALL=1 CHECK_ONLY=1 ${name}
-
-  # Convert PS2 ROMs with 6 workers
-  RECURSIVE=1 ROM_DIR="/path/to/roms/ps2" JOBS=6 ${name}
-
-  # Convert whole library, write CHDs to a separate folder (mirror structure)
-  RECURSIVE=1 ROM_DIR="/path/to/roms" OUT_DIR="/srv/chd" JOBS=6 ${name}
-
-  # Dry-run (no changes), log per-title to /var/log/chd
-  DRYRUN=1 RECURSIVE=1 LOG_DIR="/var/log/chd" ROM_DIR="/path/to/roms" ${name}
-
-${C_BOLD}SUPPORTED INPUTS${C_RESET}
+SUPPORTED INPUTS
   Archives: .7z, .zip
-  CD images: .cue, .gdi, .toc
-  DVD images: .iso, .gcm
-  (Unsupported directly: .wbfs, .cso, .nkit — convert back to .iso first)
+  CDs:      .cue, .gdi, .toc
+  DVDs:     .iso, .gcm
+  (Unsupported: .wbfs/.cso/.nkit — convert back to .iso first)
 
-${C_BOLD}DEPENDENCIES${C_RESET}
-  7-Zip CLI (7zz or 7z): package ${C_BOLD}7zip${C_RESET} (or ${C_BOLD}p7zip/p7zip-full${C_RESET})
-  chdman: package ${C_BOLD}mame-tools${C_RESET} / ${C_BOLD}mame${C_RESET}
-  ${C_DIM}The script auto-detects apt/dnf/yum/zypper on Linux and brew on macOS; can auto-install when AUTO_INSTALL=1.${C_RESET}
+EXAMPLES
+  roms_to_chd.sh -d /path/to/roms/ps2 -r -j 6
+  roms_to_chd.sh -d /path/to/roms -o /srv/chd -r -j 6
+  roms_to_chd.sh -d /path/to/roms -c -a
 EOF
 }
 
-# Parse CLI flags (we primarily use env vars; only --help/-h is supported)
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  print_help
-  exit 0
-fi
+die_usage() { err "$1"; echo; print_usage; exit 2; }
 
-# ===== Package manager detection (Linux + macOS Homebrew) =====
-PKG_MGR=""
-PKG_INSTALL_CMD=""
+# ------------- Arg parsing (short + long) -------------
+parse_args() {
+  while (( $# )); do
+    case "$1" in
+      -d|--rom-dir)      ROM_DIR="${2:-}"; shift 2 ;;
+      -r|--recursive)    RECURSIVE=1; shift ;;
+      -o|--out-dir)      OUT_DIR="${2:-}"; shift 2 ;;
+      -l|--log-dir)      LOG_DIR="${2:-}"; shift 2 ;;
+      -j|--jobs)         JOBS="${2:-}"; shift 2 ;;
+      -n|--dry-run)      DRYRUN=1; shift ;;
+      -a|--auto-install) AUTO_INSTALL=1; shift ;;
+      -c|--check-only)   CHECK_ONLY=1; shift ;;
+          --7z)          SEVENZIP_BIN="${2:-}"; shift 2 ;;
+      -h|--help)         print_usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die_usage "Unknown option: $1" ;;
+      *)  die_usage "Unexpected argument: $1" ;;
+    esac
+  done
+  [[ -n "$ROM_DIR" ]] || die_usage "Missing required: --rom-dir"
+  [[ -d "$ROM_DIR" ]] || { err "rom-dir not found: $ROM_DIR"; exit 1; }
+  [[ -z "${SEVENZIP_BIN}" || "$SEVENZIP_BIN" == "7z" || "$SEVENZIP_BIN" == "7zz" ]] || die_usage "--7z must be 7z or 7zz"
+  [[ "$JOBS" =~ ^[0-9]+$ ]] || die_usage "--jobs must be an integer"
+  (( JOBS>0 )) || die_usage "--jobs must be > 0"
+}
+
+# ------------- Preflight (pkg mgr + deps) -------------
+PKG_MGR=""; PKG_INSTALL=""
 detect_pkg_mgr() {
-  if command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR="apt"
-    PKG_INSTALL_CMD="sudo apt update && sudo apt install -y"
-  elif command -v dnf >/dev/null 2>&1; then
-    PKG_MGR="dnf"
-    PKG_INSTALL_CMD="sudo dnf install -y"
-  elif command -v yum >/dev/null 2>&1; then
-    PKG_MGR="yum"
-    PKG_INSTALL_CMD="sudo yum install -y"
-  elif command -v zypper >/dev/null 2>&1; then
-    PKG_MGR="zypper"
-    PKG_INSTALL_CMD="sudo zypper install -y"
-  elif command -v brew >/dev/null 2>&1; then
-    PKG_MGR="brew"
-    PKG_INSTALL_CMD="brew install"
+  if command -v apt-get >/dev/null; then PKG_MGR=apt;    PKG_INSTALL="sudo apt update && sudo apt install -y"
+  elif command -v dnf     >/dev/null; then PKG_MGR=dnf;    PKG_INSTALL="sudo dnf install -y"
+  elif command -v yum     >/dev/null; then PKG_MGR=yum;    PKG_INSTALL="sudo yum install -y"
+  elif command -v zypper  >/dev/null; then PKG_MGR=zypper; PKG_INSTALL="sudo zypper install -y"
+  elif command -v brew    >/dev/null; then PKG_MGR=brew;   PKG_INSTALL="brew install"
+  else PKG_MGR=unknown; fi
+}
+auto_install() {
+  (( AUTO_INSTALL )) || return 1
+  [[ -n "$PKG_INSTALL" ]] || return 1
+  if [[ "$PKG_MGR" == "brew" ]]; then
+    for p in "$@"; do brew list --versions "$p" >/dev/null 2>&1 || brew install "$p"; done
   else
-    PKG_MGR="unknown"
+    eval "$PKG_INSTALL $*"
   fi
 }
-
-have_pkg() {
-  case "$PKG_MGR" in
-    apt)
-      dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -q "install ok installed" ;;
-    dnf|yum|zypper)
-      rpm -q "$1" >/dev/null 2>&1 ;;
-    brew)
-      brew list --versions "$1" >/dev/null 2>&1 ;;
-    *)
-      return 1 ;;
-  esac
-}
-
-try_auto_install() {
-  # $@: package names
-  if (( AUTO_INSTALL )) && [[ -n "$PKG_INSTALL_CMD" ]]; then
-    log "Attempting automatic install (${PKG_MGR}): $*"
-    if [[ "$PKG_MGR" == "brew" ]]; then
-      # brew does not use sudo and may have different package names; try sequentially
-      for p in "$@"; do
-        brew list --versions "$p" >/dev/null 2>&1 || brew install "$p" || true
-      done
-    else
-      # shellcheck disable=SC2086
-      eval "$PKG_INSTALL_CMD $*"
-    fi
-  else
-    return 1
-  fi
-}
-
-# ===== Preflight (multi-distro + macOS) =====
-SEVENZIP_BIN="${SEVENZIP_BIN:-}"             # Will be set to 7zz or 7z
 
 preflight() {
   detect_pkg_mgr
-  if [[ "$PKG_MGR" == "unknown" ]]; then
-    warn "Could not detect package manager. Proceeding only if binaries are present."
-  else
-    log "Detected package manager: $PKG_MGR"
-  fi
+  [[ -n "$SEVENZIP_BIN" ]] || { command -v 7zz >/dev/null && SEVENZIP_BIN=7zz || command -v 7z >/dev/null && SEVENZIP_BIN=7z || true; }
 
-  log "Preflight: checking required tools…"
-  local need_pkgs=()
-  local alt_pkgs=()
+  local need_7z= need_chd=
+  [[ -z "${SEVENZIP_BIN:-}" ]] && need_7z=1
+  command -v chdman >/dev/null || need_chd=1
 
-  # 7-Zip binary preference: 7zz (7zip) -> 7z (p7zip-full / p7zip)
-  if [[ -z "${SEVENZIP_BIN}" ]]; then
-    if command -v 7zz >/dev/null 2>&1; then
-      SEVENZIP_BIN="7zz"
-    elif command -v 7z >/dev/null 2>&1; then
-      SEVENZIP_BIN="7z"
-    fi
-  fi
-
-  if [[ -z "${SEVENZIP_BIN}" ]]; then
+  if [[ -n "$need_7z" || -n "$need_chd" ]]; then
     case "$PKG_MGR" in
-      apt)
-        have_pkg 7zip       || need_pkgs+=("7zip")
-        have_pkg p7zip-full || alt_pkgs+=("p7zip-full") ;;
-      dnf|yum|zypper)
-        have_pkg 7zip   || need_pkgs+=("7zip")
-        have_pkg p7zip  || alt_pkgs+=("p7zip") ;;
-      brew)
-        have_pkg 7zip  || need_pkgs+=("7zip")
-        have_pkg p7zip || alt_pkgs+=("p7zip") ;;
+      apt)    p_7z=(7zip p7zip-full); p_chd=(mame-tools mame) ;;
+      dnf|yum|zypper) p_7z=(7zip p7zip); p_chd=(mame-tools mame) ;;
+      brew)   p_7z=(7zip p7zip); p_chd=(mame) ;;
+      *)      ;;
     esac
+    [[ -n "$need_7z" ]] && auto_install "${p_7z[@]:-}" || true
+    [[ -n "$need_chd" ]] && auto_install "${p_chd[@]:-}" || true
+    [[ -z "${SEVENZIP_BIN:-}" ]] && { command -v 7zz >/dev/null && SEVENZIP_BIN=7zz || command -v 7z >/dev/null && SEVENZIP_BIN=7z || true; }
   fi
 
-  # chdman provider
-  if ! command -v chdman >/dev/null 2>&1; then
+  if [[ -z "${SEVENZIP_BIN:-}" ]]; then
+    echo -e "\nMissing 7-Zip CLI (7zz/7z). Install via:"
     case "$PKG_MGR" in
-      apt)
-        if ! have_pkg mame-tools && ! have_pkg mame; then
-          need_pkgs+=("mame-tools")
-        fi ;;
-      dnf|yum|zypper)
-        if ! have_pkg mame-tools && ! have_pkg mame; then
-          need_pkgs+=("mame-tools"); alt_pkgs+=("mame")
-        fi ;;
-      brew)
-        if ! have_pkg mame; then
-          need_pkgs+=("mame")
-        fi ;;
+      apt) echo "  sudo apt install 7zip    # or: sudo apt install p7zip-full" ;;
+      dnf) echo "  sudo dnf install 7zip    # or: sudo dnf install p7zip" ;;
+      yum) echo "  sudo yum install 7zip    # or: sudo yum install p7zip" ;;
+      zypper) echo "  sudo zypper install 7zip # or: sudo zypper install p7zip" ;;
+      brew) echo "  brew install 7zip        # or: brew install p7zip" ;;
+      *) echo "  Install 7-Zip via your package manager." ;;
     esac
+    exit 2
   fi
-
-  # Attempt auto-install if requested
-  if (( ${#need_pkgs[@]} )); then
-    if (( AUTO_INSTALL )) && [[ -n "$PKG_INSTALL_CMD" ]]; then
-      if ! try_auto_install "${need_pkgs[@]}"; then
-        try_auto_install "${need_pkgs[@]}" "${alt_pkgs[@]}" || true
-      fi
-    fi
-  fi
-
-  # Re-resolve after possible install
-  if [[ -z "${SEVENZIP_BIN}" ]]; then
-    if command -v 7zz >/dev/null 2>&1; then SEVENZIP_BIN="7zz"; fi
-    if [[ -z "${SEVENZIP_BIN}" ]] && command -v 7z >/dev/null 2>&1; then SEVENZIP_BIN="7z"; fi
-  fi
-
-  # Final checks
-  local missing=0
-  if [[ -z "${SEVENZIP_BIN}" ]]; then
-    printf "\nMissing requirement: 7-Zip CLI (7zz or 7z).\n"
+  if ! command -v chdman >/dev/null; then
+    echo -e "\nMissing chdman (mame-tools/mame). Install via:"
     case "$PKG_MGR" in
-      apt)    printf "Install: sudo apt update && sudo apt install 7zip   # or: sudo apt install p7zip-full\n" ;;
-      dnf)    printf "Install: sudo dnf install 7zip   # or: sudo dnf install p7zip\n" ;;
-      yum)    printf "Install: sudo yum install 7zip   # or: sudo yum install p7zip\n" ;;
-      zypper) printf "Install: sudo zypper install 7zip   # or: sudo zypper install p7zip\n" ;;
-      brew)   printf "Install: brew install 7zip   # or: brew install p7zip\n" ;;
-      *)      printf "Please install 7-Zip CLI (7zz/7z) via your package manager.\n" ;;
+      apt) echo "  sudo apt install mame-tools  # or: sudo apt install mame" ;;
+      dnf) echo "  sudo dnf install mame-tools  # or: sudo dnf install mame" ;;
+      yum) echo "  sudo yum install mame-tools  # or: sudo yum install mame" ;;
+      zypper) echo "  sudo zypper install mame-tools  # or: sudo zypper install mame" ;;
+      brew) echo "  brew install mame" ;;
+      *) echo "  Install mame-tools/mame via your package manager." ;;
     esac
-    missing=1
-  fi
-
-  if ! command -v chdman >/dev/null 2>&1; then
-    printf "\nMissing requirement: chdman (from mame-tools or mame).\n"
-    case "$PKG_MGR" in
-      apt)    printf "Install: sudo apt update && sudo apt install mame-tools   # or: sudo apt install mame\n" ;;
-      dnf)    printf "Install: sudo dnf install mame-tools   # or: sudo dnf install mame\n" ;;
-      yum)    printf "Install: sudo yum install mame-tools   # or: sudo yum install mame\n" ;;
-      zypper) printf "Install: sudo zypper install mame-tools   # or: sudo zypper install mame\n" ;;
-      brew)   printf "Install: brew install mame\n" ;;
-      *)      printf "Please install chdman via your package manager (package: mame-tools or mame).\n" ;;
-    esac
-    missing=1
-  fi
-
-  if (( missing )); then
     exit 2
   fi
 
   ok "Preflight OK: using ${SEVENZIP_BIN} and chdman."
-  export SEVENZIP_BIN
-  if (( CHECK_ONLY )); then
-    warn "CHECK_ONLY=1 set; exiting after preflight."
-    exit 0
-  fi
+  (( CHECK_ONLY )) && { warn "check-only complete; exiting."; exit 0; }
 }
 
-# ===== Helpers =====
-lower_ext() { local f="$1"; echo "${f##*.}" | tr '[:upper:]' '[:lower:]'; }
-is_dvd_ext() { local e; e="$(lower_ext "$1")"; for x in "${DVD_EXTS[@]}"; do [[ "$e" == "$x" ]] && return 0; done; return 1; }
-is_cd_ext()  { local e; e="$(lower_ext "$1")"; for x in "${CD_EXTS[@]}";  do [[ "$e" == "$x" ]] && return 0; done; return 1; }
+# ------------- Helpers -------------
+DVD_EXTS="iso gcm"
+CD_EXTS="cue gdi toc"
 
-sanitize_title() {
-  # Turn a filename into a safe log filename
-  local t="$1"
-  t="${t// /_}"
-  t="$(printf '%s' "$t" | tr -cd '[:alnum:]_.\-]')"
-  printf '%s' "$t"
-}
+is_ext_in() { local e="${1##*.}"; e="${e,,}"; shift; for x in "$@"; do [[ "$e" == "$x" ]] && return 0; done; return 1; }
+is_cd()  { is_ext_in "$1" $CD_EXTS; }
+is_dvd() { is_ext_in "$1" $DVD_EXTS; }
 
-# Mirror ROM_DIR structure inside OUT_DIR. Prints destination dir to stdout.
 dest_dir_for() {
-  local src_dir="$1"
-  if [[ -z "${OUT_DIR}" ]]; then
-    printf '%s\n' "$src_dir"
-    return 0
-  fi
-  local rel="$src_dir"
-  case "$src_dir" in
-    "$ROM_DIR"/*) rel="${src_dir#$ROM_DIR/}" ;;
-    "$ROM_DIR")   rel="" ;;
-    *)            rel="" ;;  # unknown base; drop into OUT_DIR root
-  esac
-  if [[ -n "$rel" ]]; then
-    printf '%s\n' "${OUT_DIR%/}/$rel"
-  else
-    printf '%s\n' "${OUT_DIR%/}"
-  fi
-}
-
-ensure_dir() {
-  local d="$1"
-  if (( DRYRUN )); then
-    log "DRYRUN: would mkdir -p -- $d"
-  else
-    mkdir -p -- "$d"
-  fi
-}
-
-# chd output path helper
-chd_path_for() {
-  local src_file="$1"
-  local src_dir; src_dir="$(dirname "$src_file")"
-  local base_noext; base_noext="$(basename "${src_file%.*}")"
-  local outdir; outdir="$(dest_dir_for "$src_dir")"
-  printf '%s/%s.chd\n' "$outdir" "$base_noext"
-}
-
-# Per-title log path
-log_path_for() {
-  local title="$1"
-  local base="$(sanitize_title "$title")"
-  printf '%s/%s.log\n' "$LOG_DIR" "$base"
-}
-
-run_and_log() {
-  # $1: log file, rest: command...
-  local logfile="$1"; shift
-  if (( DRYRUN )); then
-    log "DRYRUN: ${*}"
-    printf '[%s] DRYRUN: %s\n' "$(timestamp)" "$*" >>"$logfile"
-    return 0
-  fi
-  printf '[%s] RUN: %s\n' "$(timestamp)" "$*" >>"$logfile"
-  # run command piping both stdout/stderr to tee
-  set +e
-  ( "$@" ) 2>&1 | tee -a "$logfile"
-  local rc=${PIPESTATUS[0]}
-  set -e
-  return $rc
-}
-
-unsupported_image_notice() {
-  local f="$1"
-  case "$(lower_ext "$f")" in
-    cso|wbfs|nkit|nkit.iso|nkit.gcm)
-      warn "SKIP: '$f' is $(lower_ext "$f"); chdman cannot convert these directly. Convert back to ISO first." ;;
-    *) warn "SKIP: Unsupported source for CHD: $f" ;;
+  local srcd="$1"
+  [[ -z "$OUT_DIR" ]] && { printf '%s\n' "$srcd"; return; }
+  case "$srcd" in
+    "$ROM_DIR"/*) printf '%s/%s\n' "${OUT_DIR%/}" "${srcd#"$ROM_DIR"/}" ;;
+    "$ROM_DIR")   printf '%s\n' "${OUT_DIR%/}" ;;
+    *)            printf '%s\n' "${OUT_DIR%/}" ;;
   esac
 }
+ensure_dir() { (( DRYRUN )) && { log "DRYRUN: mkdir -p -- $1"; return; } ; mkdir -p -- "$1"; }
+chd_path_for(){ local d; d="$(dirname "$1")"; local b="${1##*/}"; b="${b%.*}"; printf '%s/%s.chd\n' "$(dest_dir_for "$d")" "$b"; }
+sanitize(){ printf '%s' "${1// /_}" | tr -cd '[:alnum:]_.-'; }
+log_path_for(){ local t; t="$(sanitize "$1")"; printf '%s/%s.log\n' "$LOG_DIR" "$t"; }
 
-# Parse a .cue/.toc to list referenced track files
-cue_list_sources() {
+run_log() { # log, cmd...
+  local lf="$1"; shift
+  (( DRYRUN )) && { log "DRYRUN: $*"; printf '[%s] DRYRUN: %s\n' "$(ts)" "$*" >>"$lf"; return 0; }
+  printf '[%s] RUN: %s\n' "$(ts)" "$*" >>"$lf"
+  set +e; ( "$@" ) 2>&1 | tee -a "$lf"; local rc=${PIPESTATUS[0]}; set -e; return $rc
+}
+safe_cleanup() { # chd log sources...
+  local chd="$1"; shift; local lf="$1"; shift
+  (( DRYRUN )) && { printf '[%s] DRYRUN: would delete: %s\n' "$(ts)" "$*" >>"$lf"; return; }
+  [[ -s "$chd" ]] || return
+  for s in "$@"; do [[ -e "$s" ]] && { printf '[%s] DELETE: %s\n' "$(ts)" "$s" >>"$lf"; rm -f -- "$s"; }; done
+}
+cue_sources() { # list files referenced by .cue/.toc
   local cue="$1" dir; dir="$(dirname "$cue")"
-  awk '
-    BEGIN{IGNORECASE=1}
-    $1=="FILE" {
-      if ($2 ~ /^"/) {
-        fname=$2
-        for (i=3; i<=NF && $i !~ /"$/; i++) { fname=fname" "$i }
-        if ($i ~ /"$/) fname=fname" "$i
-        gsub(/^"/,"",fname); gsub(/"$/,"",fname)
-        print fname
-      } else { print $2 }
-    }
-  ' "$cue" | while IFS= read -r rel; do [[ -e "$dir/$rel" ]] && printf '%s\n' "$dir/$rel"; done
+  awk 'BEGIN{IGNORECASE=1} $1=="FILE"{ s=$0; sub(/^.*FILE[ \t]+"/,"",s); sub(/"[ \t]+.*/,"",s); if (s=="") {split($0,a,/FILE[ \t]+/); split(a[2],b,/ /); s=b[1]} print s }' "$cue" | \
+  while IFS= read -r r; do [[ -e "$dir/$r" ]] && printf '%s\n' "$dir/$r"; done
 }
 
-to_chd() {
-  local input="$1" out="$2" logfile="$3"
-  local outdir; outdir="$(dirname "$out")"
-  ensure_dir "$outdir"
-  if is_cd_ext "$input"; then
-    run_and_log "$logfile" chdman createcd -i "$input" -o "$out"
-  elif is_dvd_ext "$input"; then
-    run_and_log "$logfile" chdman createdvd -i "$input" -o "$out"
-  else
-    unsupported_image_notice "$input"; return 2
-  fi
-}
+process_extracted() {
+  local work="$1" base="$2" srcdir="$3" lf="$4" outd; outd="$(dest_dir_for "$srcdir")"; ensure_dir "$outd"
+  local chd="$outd/$base.chd"
 
-safe_cleanup_sources() {
-  local chd="$1"; shift
-  local logfile="$1"; shift
-  local sources=("$@")
-  if (( DRYRUN )); then
-    log "DRYRUN: would delete sources after CHD exists"
-    printf '[%s] DRYRUN: would delete: %s\n' "$(timestamp)" "${sources[*]}" >>"$logfile"
-    return 0
-  fi
-  if [[ -f "$chd" && -s "$chd" ]]; then
-    for s in "${sources[@]}"; do
-      if [[ -e "$s" ]]; then
-        printf '[%s] DELETE: %s\n' "$(timestamp)" "$s" >>"$logfile"
-        rm -f -- "$s"
-      fi
-    done
-  fi
-}
-
-process_extracted_set() {
-  local workdir="$1" basename_noext="$2" src_dir="$3" logfile="$4"
-  local dest_dir; dest_dir="$(dest_dir_for "$src_dir")"
-  ensure_dir "$dest_dir"
-  local chd="${dest_dir}/${basename_noext}.chd"
-
-  local desc
-  desc="$(find "$workdir" -maxdepth 1 -type f \( -iname '*.cue' -o -iname '*.gdi' -o -iname '*.toc' \) | head -n1 || true)"
+  local desc; desc="$(find "$work" -maxdepth 1 -type f \( -iname '*.cue' -o -iname '*.gdi' -o -iname '*.toc' \) -print -quit)"
   if [[ -n "$desc" ]]; then
-    log "Converting (CD) $basename_noext -> $(basename "$chd")"
-    to_chd "$desc" "$chd" "$logfile"
-    mapfile -t tracks < <(cue_list_sources "$desc" 2>/dev/null || true)
-    safe_cleanup_sources "$chd" "$logfile" "$desc" "${tracks[@]}"
+    log "Converting (CD) $base -> $(basename "$chd")"
+    run_log "$lf" chdman createcd -i "$desc" -o "$chd"
+    mapfile -t tracks < <(cue_sources "$desc" 2>/dev/null || true)
+    safe_cleanup "$chd" "$lf" "$desc" "${tracks[@]}"
     return 0
   fi
 
-  local dvd
-  dvd="$(find "$workdir" -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.gcm' \) | head -n1 || true)"
+  local dvd; dvd="$(find "$work" -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.gcm' \) -print -quit)"
   if [[ -n "$dvd" ]]; then
-    log "Converting (DVD) $basename_noext -> $(basename "$chd")"
-    to_chd "$dvd" "$chd" "$logfile"
-    safe_cleanup_sources "$chd" "$logfile" "$dvd"
+    log "Converting (DVD) $base -> $(basename "$chd")"
+    run_log "$lf" chdman createdvd -i "$dvd" -o "$chd"
+    safe_cleanup "$chd" "$lf" "$dvd"
     return 0
   fi
 
-  warn "No convertible image found for $basename_noext — skipping."
+  warn "No convertible image found for $base — skipping."
   return 2
 }
 
-process_archive() {
-  local archive="$1" src_dir="$2"
-  local fname="$(basename "$archive")"
-  local basename_noext="${fname%.*}"
-  local logfile="$(log_path_for "$basename_noext")"
+process_archive() { # archive, srcdir
+  local arc="$1" srcd="$2" name="$(basename "$arc")" base="${name%.*}" lf; lf="$(log_path_for "$base")"
+  printf 'Title: %s\nSource: %s\n\n' "$base" "$arc" >"$lf"
 
-  printf '%s\n%s\n\n' "Title: $basename_noext" "Source: $archive" >"$logfile"
+  log "Extracting: $name"
+  (( DRYRUN )) && { printf '[%s] DRYRUN: extract "%s"\n' "$(ts)" "$arc" >>"$lf"; return 0; }
 
-  log "Extracting: $fname"
-  if (( DRYRUN )); then
-    printf '[%s] DRYRUN: would extract "%s"\n' "$(timestamp)" "$archive" >>"$logfile"
-    return 0
-  fi
+  local tmp; tmp="$(mktemp -d --tmpdir="$srcd" ".extract_${base}_XXXX")"
+  run_log "$lf" "$SEVENZIP_BIN" x -y -o"$tmp" -- "$arc" || { err "Extraction failed: $name"; printf '[%s] ERROR: extraction failed\n' "$(ts)" >>"$lf"; rm -rf -- "$tmp"; return 2; }
 
-  local workdir="$(mktemp -d --tmpdir="$src_dir" ".extract_${basename_noext}_XXXX")"
-  run_and_log "$logfile" "$SEVENZIP_BIN" x -y -o"$workdir" -- "$archive" || {
-    err "Extraction failed: $fname"
-    printf '[%s] ERROR: extraction failed for %s\n' "$(timestamp)" "$fname" >>"$logfile"
-    rm -rf -- "$workdir"; return 2
-  }
+  process_extracted "$tmp" "$base" "$srcd" "$lf" || { printf '[%s] ERROR: convert step failed\n' "$(ts)" >>"$lf"; rm -rf -- "$tmp"; return 2; }
 
-  process_extracted_set "$workdir" "$basename_noext" "$src_dir" "$logfile" || {
-    err "FAILED to find/convert content for $fname"
-    printf '[%s] ERROR: convert step failed for %s\n' "$(timestamp)" "$fname" >>"$logfile"
-    rm -rf -- "$workdir"; return 2
-  }
-
-  if [[ -s "$(dest_dir_for "$src_dir")/${basename_noext}.chd" ]]; then
-    ok "Success: ${basename_noext}.chd created. Cleaning archive."
-    printf '[%s] SUCCESS: created CHD\n' "$(timestamp)" >>"$logfile"
-    safe_cleanup_sources "$(dest_dir_for "$src_dir")/${basename_noext}.chd" "$logfile" "$archive"
+  local outchd; outchd="$(dest_dir_for "$srcd")/$base.chd"
+  if [[ -s "$outchd" ]]; then
+    ok "Success: $base.chd created; cleaning archive."
+    printf '[%s] SUCCESS: created CHD\n' "$(ts)" >>"$lf"
+    safe_cleanup "$outchd" "$lf" "$arc"
   else
-    warn "CHD not created for $fname; leaving archive."
-    printf '[%s] WARN: CHD not created; archive kept\n' "$(timestamp)" >>"$logfile"
+    warn "CHD not created for $name; leaving archive."
+    printf '[%s] WARN: CHD not created; kept archive\n' "$(ts)" >>"$lf"
   fi
-  rm -rf -- "$workdir"
+  rm -rf -- "$tmp"
 }
 
-process_loose_single() {
-  local f="$1"
-  local stem="${f%.*}"
-  local title="$(basename "$stem")"
-  local logfile="$(log_path_for "$title")"
-  printf '%s\n%s\n\n' "Title: $title" "Source: $f" >"$logfile"
+process_loose() { # file
+  local f="$1" stem="${f%.*}" title="$(basename "$stem")" lf; lf="$(log_path_for "$title")"
+  printf 'Title: %s\nSource: %s\n\n' "$title" "$f" >"$lf"
+  local chd; chd="$(chd_path_for "$f")"
+  [[ -s "$chd" ]] && { warn "CHD exists for $(basename "$f"); skip."; printf '[%s] SKIP: CHD exists: %s\n' "$(ts)" "$chd" >>"$lf"; return 0; }
 
-  local chd="$(chd_path_for "$f")"
-
-  if [[ -s "$chd" ]]; then
-    warn "CHD already exists for $(basename "$f"); skipping."
-    printf '[%s] SKIP: CHD already exists: %s\n' "$(timestamp)" "$chd" >>"$logfile"
-    return 0
-  fi
-
-  if is_cd_ext "$f"; then
-    log "Converting (CD) $(basename "$stem") -> $(basename "$chd")"
-    to_chd "$f" "$chd" "$logfile"
-    mapfile -t refs < <(cue_list_sources "$f" 2>/dev/null || true)
-    safe_cleanup_sources "$chd" "$logfile" "$f" "${refs[@]}"
-  elif is_dvd_ext "$f"; then
-    log "Converting (DVD) $(basename "$stem") -> $(basename "$chd")"
-    to_chd "$f" "$chd" "$logfile"
-    safe_cleanup_sources "$chd" "$logfile" "$f"
+  if is_cd "$f"; then
+    log "Converting (CD) $title -> $(basename "$chd")"
+    run_log "$lf" chdman createcd -i "$f" -o "$chd"
+    mapfile -t refs < <(cue_sources "$f" 2>/dev/null || true)
+    safe_cleanup "$chd" "$lf" "$f" "${refs[@]}"
+  elif is_dvd "$f"; then
+    log "Converting (DVD) $title -> $(basename "$chd")"
+    run_log "$lf" chdman createdvd -i "$f" -o "$chd"
+    safe_cleanup "$chd" "$lf" "$f"
   else
-    unsupported_image_notice "$f"
-    printf '[%s] WARN: unsupported image type\n' "$(timestamp)" >>"$logfile"
-    return 2
+    warn "Unsupported input: $f"
+    printf '[%s] WARN: unsupported image type\n' "$(ts)" >>"$lf"
   fi
 }
 
-# Worker entrypoints for xargs parallelism
-if [[ "${1:-}" == "__proc_archive" ]]; then
-  shift; process_archive "$@"; exit $?
-elif [[ "${1:-}" == "__proc_loose" ]]; then
-  shift; process_loose_single "$@"; exit $?
+# Worker dispatch for xargs
+if [[ "${1:-}" == "__w_arc" ]]; then shift; process_archive "$@"; exit $?
+elif [[ "${1:-}" == "__w_loose" ]]; then shift; process_loose "$@"; exit $?
 fi
 
-# Corrected: accept ALL predicates and forward them to find safely.
-gfind() {
-  local args=("$@")
-  if (( RECURSIVE )); then
-    find "$ROM_DIR" "${args[@]}" -print0 2>/dev/null || true
-  else
-    find "$ROM_DIR" -maxdepth 1 "${args[@]}" -print0 2>/dev/null || true
-  fi
-}
-
 main() {
-  [[ -d "$ROM_DIR" ]] || { err "ROM_DIR does not exist: $ROM_DIR"; exit 1; }
+  parse_args "$@"
+  preflight
 
-  preflight   # resolves tools and exports SEVENZIP_BIN
-
-  # Set up LOG_DIR default
-  if [[ -z "$LOG_DIR" ]]; then
-    LOG_DIR="$ROM_DIR/.chd_logs"
-  fi
+  # Logs
+  [[ -n "$LOG_DIR" ]] || LOG_DIR="$ROM_DIR/.chd_logs"
   ensure_dir "$LOG_DIR"
-  log "Per-title logs -> $LOG_DIR"
+  log "Logs -> $LOG_DIR"
 
-  if [[ -n "$OUT_DIR" ]]; then
-    log "Writing CHDs under OUT_DIR: $OUT_DIR (mirroring structure from ROM_DIR)"
-    (( ! DRYRUN )) && mkdir -p -- "$OUT_DIR"
-  fi
-  (( DRYRUN )) && warn "DRYRUN is ON — no files will be extracted, converted, or deleted."
+  # OUT_DIR
+  [[ -n "$OUT_DIR" ]] && { ensure_dir "$OUT_DIR"; log "OUT_DIR -> $OUT_DIR (mirroring rom-dir)"; }
 
-  log "Starting ROMs -> CHD in: $ROM_DIR  (JOBS=$JOBS, RECURSIVE=$RECURSIVE)"
+  (( DRYRUN )) && warn "DRY-RUN active — no extraction/convert/delete."
+  log "Start: rom-dir=$ROM_DIR  jobs=$JOBS  recursive=$RECURSIVE"
 
-  # ---- Parallel: archives first ----
-  mapfile -d '' -t ARCHIVES < <( gfind -type f \( -iname '*.7z' -o -iname '*.zip' \) )
-  log "Archives found: ${#ARCHIVES[@]}"
-  if (( ${#ARCHIVES[@]} )); then
-    printf '%s\0' "${ARCHIVES[@]}" | xargs -0 -I{} -P "$JOBS" bash -c '
-      set -euo pipefail
-      "'"$0"'" __proc_archive "$@" 
-    ' _ {} "$(dirname "{}")"
+  # Depth options for find
+  if (( RECURSIVE )); then
+    depth_opts=()
   else
-    warn "No archives found (.7z/.zip)."
+    depth_opts=("-maxdepth" "1")
   fi
 
-  # ---- Parallel: loose images ----
-  mapfile -d '' -t LOOSER_CD  < <( gfind -type f \( -iname '*.cue' -o -iname '*.gdi' -o -iname '*.toc' \) )
-  log "CD-like images found: ${#LOOSER_CD[@]}"
-  mapfile -d '' -t LOOSER_DVD < <( gfind -type f \( -iname '*.iso' -o -iname '*.gcm' \) )
-  log "DVD-like images found: ${#LOOSER_DVD[@]}"
+  # Archives
+  find "$ROM_DIR" "${depth_opts[@]}" -type f \( -iname '*.7z' -o -iname '*.zip' \) -print0 2>/dev/null \
+  | xargs -0 -I{} -P "$JOBS" bash -c '
+      set -euo pipefail
+      f="{}"; d="$(dirname "{}")"
+      "'"$0"'" __w_arc "$f" "$d"
+    ' || true
 
-  if (( ${#LOOSER_CD[@]} )); then
-    printf '%s\0' "${LOOSER_CD[@]}" | xargs -0 -I{} -P "$JOBS" bash -c '
+  # Loose images
+  find "$ROM_DIR" "${depth_opts[@]}" -type f \
+    \( -iname '*.cue' -o -iname '*.gdi' -o -iname '*.toc' -o -iname '*.iso' -o -iname '*.gcm' \) \
+    -print0 2>/dev/null \
+  | xargs -0 -I{} -P "$JOBS" bash -c '
       set -euo pipefail
-      "'"$0"'" __proc_loose "$@" 
-    ' _ {} 
-  fi
-  if (( ${#LOOSER_DVD[@]} )); then
-    printf '%s\0' "${LOOSER_DVD[@]}" | xargs -0 -I{} -P "$JOBS" bash -c '
-      set -euo pipefail
-      "'"$0"'" __proc_loose "$@" 
-    ' _ {}
-  fi
+      "'"$0"'" __w_loose "{}"
+    ' || true
 
   ok "Done."
 }
