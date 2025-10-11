@@ -23,6 +23,8 @@ It performs:
 
 ## 🧰 Requirements
 
+> 🟢 **Note:** This script is designed for Debian-based Linux distributions (Ubuntu, Debian, Mint, etc.).
+
 | Tool | Package | Description |
 |------|----------|-------------|
 | 7zz | 7zip | Official 7-Zip CLI |
