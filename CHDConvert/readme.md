@@ -1,123 +1,210 @@
-# 🎮 ROMs to CHD Converter (Linux/macOS)
+# ROMs → CHD Converter
 
-_Version 1.2.0 — Flag-only CLI edition (synced with roms_to_chd.sh)_
+A fast, parallel script to convert disc-based ROM archives and loose images into `.chd` (MAME’s Compressed Hunks of Data) on Linux, Debian/Ubuntu, RHEL/CentOS/Fedora, openSUSE, and macOS (Homebrew).
 
-Convert ROM archives and disc images into **CHD format** automatically with parallel processing, per-title logs, and intelligent cleanup.
-
----
-
-## 🎯 Overview
-
-This tool extracts `.7z`/`.zip` archives, converts supported disc images (`.cue`, `.iso`, `.gdi`, `.toc`, `.gcm`) to **CHD** via `chdman`, and removes redundant source files after successful conversion. It supports parallelism, automatic dependency installation, and full log tracking.
-
-[↑ Back to top](#top)
+> Works great for Dreamcast, PS1/PS2, GameCube, and any platform where your image can be represented as **CD** (`.cue`, `.gdi`, `.toc`) or **DVD** (`.iso`, `.gcm`). Archives (`.zip`, `.7z`) are supported too.
 
 ---
 
-## 🧰 Requirements
+## Table of Contents
 
-- 7-Zip (`7z` or `7zz`)
-- `chdman` (from `mame-tools` or `mame`)
-- GNU `find`, `xargs`, and `awk`
-- Works on:
-  - ✅ Debian, Ubuntu
-  - ✅ Fedora, CentOS, RHEL
-  - ✅ openSUSE, Arch
-  - ✅ macOS (Homebrew)
-
----
-
-## ⚙️ Command-Line Options (No Environment Variables)
-
-| Option | Description |
-|-------|-------------|
-| `-d, --rom-dir DIR` | **Required.** Root directory containing ROMs |
-| `-r, --recursive` | Recurse into subfolders |
-| `-o, --out-dir DIR` | Write CHDs under this directory (mirrors rom-dir structure) |
-| `-l, --log-dir DIR` | Per-title logs directory (default: `<rom-dir>/.chd_logs`) |
-| `-j, --jobs N` | Parallel workers (default: `min(cpu,6)`) |
-| `-n, --dry-run` | Preview actions; no extraction/convert/delete |
-| `-a, --auto-install` | Try to install missing deps (apt/dnf/yum/zypper/brew) |
-| `-c, --check-only` | Check dependencies and exit |
-| `--7z BIN` | Force extractor binary (`7zz` or `7z`) |
-| `-h, --help` | Show this help text |
-
-[↑ Back to top](#top)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+  - [Options](#options)
+  - [Platforms & Extensions](#platforms--extensions)
+  - [Dry Run](#dry-run)
+  - [Force Overwrite](#force-overwrite)
+  - [Keeping Archives](#keeping-archives)
+  - [Per-Title Logs](#per-title-logs)
+  - [Parallelism](#parallelism)
+- [Examples](#examples)
+- [Exit Codes](#exit-codes)
+- [Notes & Tips](#notes--tips)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
-## 🚀 Usage Examples
+## Features
 
-### Quick Examples
+- **Archive support**: `.zip`, `.7z`
+- **Image support**:
+  - **CD**: `.cue`, `.gdi`, `.toc`
+  - **DVD**: `.iso`, `.gcm`
+- **Parallel** extraction & conversion (`--jobs N`)
+- **Dry-run** mode (`--dry-run`) prints what *would* happen
+- **Force** overwrite existing CHDs (`--force`)
+- **Platform filter**: `--only-platform dreamcast|ps2|psx|gc`
+- **Keep archives** after success (`--keep-archives`)
+- **Per-title logs** in `.<rom-dir>/.chd_logs`
+- Auto detection of package manager (apt/dnf/yum/zypper/brew); optional auto-install
+- macOS supported via Homebrew
+
+> **Not supported**: `.cdi` (Dreamcast DiscJuggler) — convert to CUE/BIN or GDI first.
+
+---
+
+## Requirements
+
+- **7-Zip CLI**: `7z` or `7zz`
+- **chdman** (from `mame` / `mame-tools`)
+- Bash 4+
+
+Install suggestions by distro:
+
+- Debian/Ubuntu: `sudo apt install 7zip mame-tools` (or `p7zip-full`, `mame`)
+- RHEL/CentOS/Fedora: `sudo dnf install 7zip mame-tools` (or `p7zip`, `mame`)
+- openSUSE: `sudo zypper install 7zip mame-tools`
+- macOS (Homebrew): `brew install 7zip mame`
+
+---
+
+## Install
+
+Place the script on your system and make it executable:
 
 ```bash
-# Dependency check
-roms_to_chd.sh -d /path/to/roms -c
-
-# Convert PS2 ROMs recursively
-roms_to_chd.sh -d /path/to/roms/ps2 -r -j 6
-
-# Write CHDs to a different drive
-roms_to_chd.sh -d /path/to/roms -o /mnt/chd -r -j 6
-
-# Dry-run: no extraction or conversion
-roms_to_chd.sh -d /path/to/roms -r -n
+sudo install -m 0755 roms_to_chd.sh /usr/local/bin/roms_to_chd.sh
 ```
 
-### Advanced
+> You can also run it in-place: `bash roms_to_chd.sh ...`
+
+---
+
+## Quick Start
+
+Dreamcast conversion (recursive, 6 workers, preview only):
 
 ```bash
-# Preflight + auto-install if missing dependencies
-roms_to_chd.sh -d /path/to/roms -c -a
-
-# Full conversion with per-title logs
-roms_to_chd.sh -d /path/to/roms -r -l /var/log/chd -j 8
+sudo /usr/local/bin/roms_to_chd.sh -d /path/to/roms/dc -r -j 6 --only-platform dreamcast --dry-run
 ```
 
-[↑ Back to top](#top)
+Then run for real:
+
+```bash
+sudo /usr/local/bin/roms_to_chd.sh -d /path/to/roms/dc -r -j 6 --only-platform dreamcast
+```
+
+Mirror output to another tree and overwrite existing CHDs:
+
+```bash
+sudo /usr/local/bin/roms_to_chd.sh -d /path/to/roms/ps2 -o /path/to/output/ps2_chd -r -j 8 --only-platform ps2 --force
+```
 
 ---
 
-## 🧩 Supported Formats
+## Usage
 
-| Category | Extensions |
-|-----------|-------------|
-| **Archives** | `.7z`, `.zip` |
-| **CD-Based** | `.cue`, `.gdi`, `.toc` |
-| **DVD-Based** | `.iso`, `.gcm` |
-| **Unsupported (must convert manually)** | `.wbfs`, `.cso`, `.nkit` |
+```text
+roms_to_chd.sh — Convert ROM archives & images to CHD (parallel, per-title logs)
+
+Required:
+  -d, --rom-dir DIR         Root directory containing ROMs
+
+Options:
+  -r, --recursive           Recurse into subfolders (default: off)
+  -o, --out-dir DIR         Write CHDs under this dir (mirrors rom-dir)
+  -l, --log-dir DIR         Per-title logs (default: <rom-dir>/.chd_logs)
+  -j, --jobs N              Parallel workers (default: min(cpu,6))
+  -n, --dry-run             Show actions only (no extract/convert/delete)
+  -c, --check-only          Only check dependencies and exit
+  -a, --auto-install        Attempt to install missing deps (apt/dnf/yum/zypper/brew)
+      --7z BIN              Force extractor (7zz or 7z)
+
+New controls:
+  -f, --force               Overwrite existing .chd files
+      --keep-archives       Keep archives after successful conversion
+      --only-platform P     Limit to one platform: dreamcast | ps2 | psx | gc
+                            (affects loose image filtering and extracted descriptors)
+```
+
+### Platforms & Extensions
+
+| Platform   | CD Descriptors           | DVD Images     | Notes                                  |
+|------------|--------------------------|----------------|----------------------------------------|
+| Dreamcast  | `.gdi`, `.toc` (+ `.cue`*) | —              | `.cdi` not supported                   |
+| PS1 (PSX)  | `.cue`                   | —              | —                                      |
+| PS2        | —                        | `.iso`         | —                                      |
+| GameCube   | —                        | `.gcm`, `.iso` | —                                      |
+
+> `--only-platform` filters **loose images** and **extracted descriptors**. Archives are still scanned (the descriptor inside must match the platform to be processed).
+
+### Dry Run
+
+Use `--dry-run` to print planned actions (no extraction, conversion, or deletion):
+
+```bash
+roms_to_chd.sh -d /path/to/roms -r -j 6 --dry-run
+```
+
+### Force Overwrite
+
+If a `.chd` already exists, add `--force` to overwrite it.
+
+### Keeping Archives
+
+By default, archives are deleted after a successful conversion. Keep them with `--keep-archives`.
+
+### Per-Title Logs
+
+All activity is written to `<rom-dir>/.chd_logs/<title>.log` by default. Use `--log-dir DIR` to change.
+
+### Parallelism
+
+Adjust `--jobs N` to balance CPU/I/O. Defaults to `min(cores,6)`.
 
 ---
 
-## 🧹 Safety Features
+## Examples
 
-- Verifies that CHDs were created successfully before deletion
-- Keeps original files if conversion fails
-- Generates per-title logs under `.chd_logs` (or custom `--log-dir`)
-- Honors `--dry-run` mode for safe preview
+- Dreamcast, recurse, preview only:
 
----
+  ```bash
+  sudo roms_to_chd.sh -d /path/to/roms/dc -r -j 6 --only-platform dreamcast --dry-run
+  ```
 
-## 🧾 Troubleshooting
+- PS2 to a mirrored output tree, overwrite any existing CHDs:
 
-- **Extraction failed:** Ensure 7-Zip (`7z` or `7zz`) is installed and usable
-- **Missing `chdman`:** Install via your package manager (e.g. `sudo apt install mame-tools`)
-- **Permission errors:** Run with `sudo` or ensure you own the directories
-- **macOS users:** Install dependencies via `brew install 7zip mame`
+  ```bash
+  sudo roms_to_chd.sh -d /path/to/roms/ps2 -o /path/to/output/ps2_chd -r -j 8 --only-platform ps2 --force
+  ```
 
-[↑ Back to top](#top)
+- Convert all supported platforms, keep original archives:
 
----
-
-## 🪟 Windows Support
-
-Windows users can use the PowerShell version for native behavior:
-
-👉 [README_windows.md](./README_windows.md)
+  ```bash
+  sudo roms_to_chd.sh -d /path/to/roms -r -j 6 --keep-archives
+  ```
 
 ---
 
-## 📜 License & Attribution
+## Exit Codes
 
-MIT License © 2025  
-Created for cross-platform ROM archival workflows with CHD conversion automation.
+- `0` — success
+- `2` — usage error or missing dependency
+- Other — propagated tool failures (7z/chdman)
+
+---
+
+## Notes & Tips
+
+- `.cdi` (Dreamcast) isn’t supported by `chdman`; convert to `.gdi` or `.cue/.bin` first.
+- Already-converted titles are skipped unless `--force` is used.
+- To re-process a single title, delete its existing `.chd` (or use `--force`).
+
+---
+
+## Troubleshooting
+
+- **Dry-run extracts files**: update to the latest script; dry-run is argument-driven for workers and should never extract/convert.
+- **“file already exists”**: use `--force` to overwrite, or delete the existing `.chd`.
+- **7z / chdman missing**: install per your distro (see [Requirements](#requirements)).
+- **Weird parsing errors**: ensure the file has Unix line-endings (`sed -i 's/\r$//' roms_to_chd.sh'`) and executable bit set.
+
+---
+
+## License
+
+MIT
