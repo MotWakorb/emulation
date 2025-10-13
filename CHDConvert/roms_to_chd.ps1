@@ -1,370 +1,450 @@
+<#
+.SYNOPSIS
+    Extract .7z archives and convert disc images (CUE/BIN, GDI, TOC, ISO/GCM) to CHD.
+
+.DESCRIPTION
+    - Optionally recurse through subfolders
+    - Per-platform filtering (PSX, PS2, Dreamcast, GameCube, SegaCD, or All)
+    - Uses 7-Zip for extraction and chdman for conversion
+    - Analyzer-friendly (approved verbs only, no null-propagation operator, no $args assignment)
+
+.PARAMETER SourceDir
+    Directory to scan for .7z archives and disc images.
+
+.PARAMETER OutputDir
+    Where to place .chd files. Defaults to SourceDir.
+
+.PARAMETER Platform
+    Optional filter: PSX|PS2|Dreamcast|GC|SegaCD|All (default: All)
+
+.PARAMETER Recurse
+    Include subdirectories.
+
+.PARAMETER KeepArchives
+    Do not delete original .7z archives after successful extraction.
+
+.PARAMETER KeepImages
+    Do not delete original image files (cue/bin/gdi/toc/iso/gcm) after successful conversion.
+
+.PARAMETER Force
+    Overwrite existing .chd outputs.
+
+.PARAMETER ChdmanPath
+    Path to chdman executable. Defaults to 'chdman.exe' on PATH.
+
+.PARAMETER SevenZipPath
+    Path to 7-Zip CLI. Defaults to 'C:\Program Files\7-Zip\7z.exe'.
+
+.PARAMETER MaxParallel
+    Max concurrent conversions (1-8). Default: 2.
+
+.PARAMETER LogDir
+    Directory for logs. Defaults to script folder \logs.
+
+.EXAMPLE
+    .\roms_to_chd.ps1 -SourceDir "D:\ROMs\psx" -Platform PSX -Recurse -Force
+#>
+
+[CmdletBinding()]
 param(
-  [Parameter(Mandatory=$true)][string]$RomDir,
-  [string]$OutDir,
-  [string]$LogDir,
-  [switch]$Recurse,
-  [int]$Jobs = 4,
-  [switch]$DryRun,
-  [switch]$Force,
-  [switch]$KeepArchives,
-  [ValidateSet('Dreamcast','PS2','PSX','GC')][string]$OnlyPlatform
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$SourceDir,
+
+    [string]$OutputDir = $SourceDir,
+
+    [ValidateSet('All','PSX','PS2','Dreamcast','GC','SegaCD')]
+    [string]$Platform = 'All',
+
+    [switch]$Recurse,
+    [switch]$KeepArchives,
+    [switch]$KeepImages,
+    [switch]$Force,
+
+    [string]$ChdmanPath = 'chdman.exe',
+    [string]$SevenZipPath = 'C:\Program Files\7-Zip\7z.exe',
+
+    [ValidateRange(1,8)]
+    [int]$MaxParallel = 2,
+
+    [string]$LogDir = (Join-Path -Path $PSScriptRoot -ChildPath 'logs')
 )
 
-# Requires PowerShell 7+ for -Parallel
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
+# -------------------------
+# Helpers (approved verbs)
+# -------------------------
 
-function Timestamp { Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
-function Write-Info([string]$msg){ Write-Host "[{0}] {1}" -f (Timestamp), $msg -ForegroundColor Cyan }
-function Write-Ok  ([string]$msg){ Write-Host "[{0}] {1}" -f (Timestamp), $msg -ForegroundColor Green }
-function Write-Warn([string]$msg){ Write-Host "[{0}] {1}" -f (Timestamp), $msg -ForegroundColor Yellow }
-function Write-Err ([string]$msg){ Write-Host "[{0}] {1}" -f (Timestamp), $msg -ForegroundColor Red }
-
-if (-not (Test-Path -LiteralPath $RomDir -PathType Container)) {
-  Write-Err "ROM directory not found: $RomDir"; exit 2
-}
-
-if (-not $LogDir) { $LogDir = Join-Path $RomDir '.chd_logs' }
-if (-not $OutDir) { $OutDir = $RomDir }
-if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
-if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
-
-function Resolve-7z {
-  $cands = @('7zz.exe','7z.exe')
-  foreach($c in $cands){
-    $p = (Get-Command $c -ErrorAction SilentlyContinue)?.Source
-    if ($p) { return $p }
-  }
-  return $null
-}
-
-$SevenZip = Resolve-7z
-$Chdman   = (Get-Command 'chdman.exe' -ErrorAction SilentlyContinue)?.Source
-if (-not $SevenZip) { Write-Err "Missing 7-Zip CLI (7z/7zz) on PATH."; exit 2 }
-if (-not $Chdman)   { Write-Err "Missing chdman.exe (from MAME) on PATH."; exit 2 }
-
-Write-Ok "Preflight OK: using $(Split-Path -Leaf $SevenZip) and $(Split-Path -Leaf $Chdman)."
-
-function SanitizeName([string]$name){
-  $invalid = [System.IO.Path]::GetInvalidFileNameChars()
-  foreach($ch in $invalid){ $name = $name -replace [Regex]::Escape([string]$ch), '_' }
-  return $name
-}
-
-function Get-DestDir([string]$srcDir){
-  $rom = (Resolve-Path -LiteralPath $RomDir).Path
-  $out = (Resolve-Path -LiteralPath $OutDir).Path
-  $src = (Resolve-Path -LiteralPath $srcDir).Path
-  if ($src -eq $rom) { return $out }
-  if ($src.StartsWith($rom, [System.StringComparison]::OrdinalIgnoreCase)){
-    $rel = $src.Substring($rom.Length).TrimStart('\','/')
-    return (Join-Path $out $rel)
-  }
-  return $out
-}
-
-$DVD_EXTS = @('.iso','.gcm')
-$CD_EXTS  = @('.cue','.gdi','.toc')
-
-function Is-CD([string]$path){ $ext = [IO.Path]::GetExtension($path).ToLowerInvariant(); return $CD_EXTS -contains $ext }
-function Is-DVD([string]$path){ $ext = [IO.Path]::GetExtension($path).ToLowerInvariant(); return $DVD_EXTS -contains $ext }
-
-function Accept-ByPlatform([string]$path){
-  if (-not $OnlyPlatform) { return $true }
-  $ext = [IO.Path]::GetExtension($path).ToLowerInvariant()
-  switch ($OnlyPlatform){
-    'Dreamcast' { return @('.gdi','.toc') -contains $ext } # avoid .cue overlap with PSX
-    'PS2'       { return @('.iso')       -contains $ext }
-    'PSX'       { return @('.cue')       -contains $ext }
-    'GC'        { return @('.gcm','.iso')-contains $ext }
-  }
-  return $true
-}
-
-function Get-CueTracks([string]$cuePath){
-  $dir = Split-Path -LiteralPath $cuePath -Parent
-  $list = @()
-  Get-Content -LiteralPath $cuePath | ForEach-Object {
-    $line = $_.Trim()
-    if ($line -match '^(?i)FILE\s+"([^"]+)"'){
-      $f = $Matches[1]
-      $full = Join-Path $dir $f
-      if (Test-Path -LiteralPath $full) { $list += $full }
+function Confirm-Directory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
-  }
-  return $list
 }
 
-function Ensure-Dir([string]$path){
-  if ($DryRun) { Write-Info "DRYRUN: mkdir -p -- $path" }
-  else { New-Item -ItemType Directory -Force -Path $path | Out-Null }
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')]
+        [string]$Level = 'INFO',
+        [string]$Context = ''
+    )
+    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $prefix = if ($Context) { "[$Context] " } else { "" }
+    $line = "$ts [$Level] ${prefix}$Message"
+    Write-Host $line
+    Add-Content -Path (Join-Path $LogDir 'roms_to_chd.log') -Value $line
 }
 
-$searchOpt = @()
-if ($Recurse){ $searchOpt += '-Recurse' }
+function Test-CDImage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $ext = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    return @('.cue','.gdi','.toc') -contains $ext
+}
 
-$archives = Get-ChildItem -LiteralPath $RomDir -File @searchOpt |
-  Where-Object { $_.Extension -match '^\.(zip|7z)$' }
+function Test-DVDImage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $ext = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    return @('.iso','.gcm') -contains $ext
+}
 
-$images = Get-ChildItem -LiteralPath $RomDir -File @searchOpt |
-  Where-Object { $_.Extension -match '^\.(cue|gdi|toc|iso|gcm|cdi)$' }
+function Get-PrimaryDescriptorPath {
+    <#
+      For CD-based sets, prefer the descriptor file (.cue/.gdi/.toc) over .bin
+      Returns $null if nothing suitable is found.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$AnyPathInSet)
 
-Write-Info "Archives found: $($archives.Count)"
-Write-Info "Loose images found: $($images.Count)"
+    $dir = Split-Path -Path $AnyPathInSet -Parent
+    $nameNoExt = [IO.Path]::GetFileNameWithoutExtension($AnyPathInSet)
 
-$Results = New-Object System.Collections.Concurrent.ConcurrentBag[object]
-
-$archives | ForEach-Object -Parallel {
-  param($SevenZip,$Chdman,$RomDir,$OutDir,$LogDir,$DryRun,$Force,$KeepArchives,$OnlyPlatform,$Results)
-
-  function Timestamp { Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
-  function LogLine([string]$lf,[string]$text){ Add-Content -LiteralPath $lf -Value ("[{0}] {1}" -f (Timestamp), $text) }
-  function Accept-ByPlatform([string]$p){
-    if (-not $OnlyPlatform) { return $true }
-    $ext = [IO.Path]::GetExtension($p).ToLowerInvariant()
-    switch ($OnlyPlatform){
-      'Dreamcast' { return @('.gdi','.toc') -contains $ext }
-      'PS2'       { return @('.iso')        -contains $ext }
-      'PSX'       { return @('.cue')        -contains $ext }
-      'GC'        { return @('.gcm','.iso') -contains $ext }
+    foreach ($ext in '.cue','.gdi','.toc') {
+        $candidate = Join-Path $dir "$nameNoExt$ext"
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
     }
-    return $true
-  }
-  function Get-CueTracks([string]$cuePath){
-    $dir = Split-Path -LiteralPath $cuePath -Parent
-    $list = @()
-    Get-Content -LiteralPath $cuePath | ForEach-Object {
-      $line = $_.Trim()
-      if ($line -match '^(?i)FILE\s+"([^"]+)"'){
-        $f = $Matches[1]
-        $full = Join-Path $dir $f
-        if (Test-Path -LiteralPath $full) { $list += $full }
-      }
+
+    $first = Get-ChildItem -LiteralPath $dir -File -Include *.cue,*.gdi,*.toc -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $first) { return $first.FullName }
+
+    return $null
+}
+
+function Test-PlatformMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateSet('All','Dreamcast','PS2','PSX','GC','SegaCD')]
+        [string]$Platform
+    )
+    if ($Platform -eq 'All') { return $true }
+
+    $ext = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    switch ($Platform) {
+        'Dreamcast' { return @('.gdi','.toc') -contains $ext }
+        'PS2'       { return @('.iso')        -contains $ext }
+        'PSX'       { return @('.cue')        -contains $ext }
+        'GC'        { return @('.gcm','.iso') -contains $ext }
+        'SegaCD'    { return @('.cue')        -contains $ext }
     }
-    return $list
-  }
-  function DestDir([string]$srcDir){
-    $rom = (Resolve-Path -LiteralPath $RomDir).Path
-    $out = (Resolve-Path -LiteralPath $OutDir).Path
-    $src = (Resolve-Path -LiteralPath $srcDir).Path
-    if ($src -eq $rom) { return $out }
-    if ($src.StartsWith($rom, [System.StringComparison]::OrdinalIgnoreCase)){
-      $rel = $src.Substring($rom.Length).TrimStart('\','/')
-      return (Join-Path $out $rel)
-    }
-    return $out
-  }
+}
 
-  $arc = $_.FullName
-  $name = $_.BaseName
-  $logf = Join-Path $LogDir ("{0}.log" -f $name)
-  "Title: $name`nSource: $arc`n" | Set-Content -LiteralPath $logf
-
-  $outChd = Join-Path (DestDir $_.DirectoryName) ("{0}.chd" -f $name)
-  if ((Test-Path -LiteralPath $outChd) -and (-not $Force)) {
-    LogLine $logf "SKIP: CHD exists: $outChd"
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='EXIST'})
-    return
-  }
-
-  if ($DryRun){
-    LogLine $logf "DRYRUN: extract `"$arc`""
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='WOULD'})
-    return
-  }
-
-  $tmp = Join-Path $_.DirectoryName (".extract_{0}_{1}" -f $name, [Guid]::NewGuid().ToString('N'))
-  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-  $args = @('x','-y',("-o{0}" -f $tmp), $arc)
-  $p = Start-Process -FilePath $SevenZip -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput $logf -RedirectStandardError $logf
-  if ($p.ExitCode -ne 0){
-    LogLine $logf "ERROR: extraction failed"
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
-    Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
-    return
-  }
-
-  $desc = Get-ChildItem -LiteralPath $tmp -File | Where-Object { $_.Extension -match '^\.(gdi|toc|cue)$' } | Select-Object -First 1
-  $dvd  = Get-ChildItem -LiteralPath $tmp -File | Where-Object { $_.Extension -match '^\.(iso|gcm)$' } | Select-Object -First 1
-  $cdi  = Get-ChildItem -LiteralPath $tmp -File | Where-Object { $_.Extension -ieq '.cdi' } | Select-Object -First 1
-
-  if ($desc -and -not (Accept-ByPlatform $desc.FullName)) { $desc = $null }
-  if ($dvd  -and -not (Accept-ByPlatform $dvd.FullName))  { $dvd = $null }
-
-  if ($desc){
-    $force = @(); if ($Force){ $force = @('-f') }
-    $args = @('createcd') + $force + @('-i',$desc.FullName,'-o',$outChd)
-    $rc = (Start-Process -FilePath $Chdman -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput $logf -RedirectStandardError $logf).ExitCode
-    if ($rc -eq 0){
-      $tracks = if ($desc.Extension -ieq '.cue'){ Get-CueTracks $desc.FullName } else { @() }
-      if (Test-Path -LiteralPath $outChd -PathType Leaf){
-        foreach($s in @($desc.FullName) + $tracks){ Remove-Item -LiteralPath $s -Force -ErrorAction SilentlyContinue }
-        if (-not $KeepArchives){ Remove-Item -LiteralPath $arc -Force -ErrorAction SilentlyContinue }
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='OK'})
-      } else {
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
-      }
+function Get-ChdOutputPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+    # Compute relative structure under SourceDir
+    $fullIn = (Resolve-Path -LiteralPath $InputPath).Path
+    $normSource = (Resolve-Path -LiteralPath $SourceDir).Path
+    $rel = if ($fullIn.StartsWith($normSource, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $fullIn.Substring($normSource.Length).TrimStart('\','/')
     } else {
-      [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
+        [IO.Path]::GetFileName($fullIn)
     }
-  }
-  elseif ($dvd){
-    $force = @(); if ($Force){ $force = @('-f') }
-    $args = @('createdvd') + $force + @('-i',$dvd.FullName,'-o',$outChd)
-    $rc = (Start-Process -FilePath $Chdman -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput $logf -RedirectStandardError $logf).ExitCode
-    if ($rc -eq 0){
-      if (Test-Path -LiteralPath $outChd -PathType Leaf){
-        Remove-Item -LiteralPath $dvd.FullName -Force -ErrorAction SilentlyContinue
-        if (-not $KeepArchives){ Remove-Item -LiteralPath $arc -Force -ErrorAction SilentlyContinue }
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='OK'})
-      } else {
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
-      }
-    } else {
-      [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
+
+    $relDir = Split-Path -Path $rel -Parent
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($InputPath)
+    $destDir = if ($relDir) { Join-Path -Path $OutputRoot -ChildPath $relDir } else { $OutputRoot }
+    Confirm-Directory $destDir
+    return (Join-Path -Path $destDir -ChildPath "$baseName.chd")
+}
+
+function Get-ChdmanArgs {
+    <#
+      Returns: [string[]] args for chdman based on input format
+      - CD-based: createcd -i <.cue/.gdi/.toc> -o <.chd>
+      - DVD/GC ISO/GCM: createdvd -i <.iso/.gcm> -o <.chd>
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+    $ext = [IO.Path]::GetExtension($InputPath).ToLowerInvariant()
+
+    if (@('.cue','.gdi','.toc') -contains $ext) {
+        return @('createcd','-i', $InputPath, '-o', $OutputPath)
     }
-  }
-  elseif ($cdi){
-    LogLine $logf "WARN: .cdi not supported by chdman; convert to GDI or CUE/BIN first."
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='WARN_CDI'})
-  }
-  else{
-    LogLine $logf "No convertible image found in archive."
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='SKIP'})
-  }
 
-  Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
-} -ThrottleLimit $Jobs -ArgumentList $SevenZip,$Chdman,$RomDir,$OutDir,$LogDir,$DryRun.IsPresent,$Force.IsPresent,$KeepArchives.IsPresent,$OnlyPlatform,$Results
-
-$images | ForEach-Object -Parallel {
-  param($Chdman,$RomDir,$OutDir,$LogDir,$DryRun,$Force,$OnlyPlatform,$Results)
-
-  function Timestamp { Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
-  function LogLine([string]$lf,[string]$text){ Add-Content -LiteralPath $lf -Value ("[{0}] {1}" -f (Timestamp), $text) }
-  function Accept-ByPlatform([string]$p){
-    if (-not $OnlyPlatform) { return $true }
-    $ext = [IO.Path]::GetExtension($p).ToLowerInvariant()
-    switch ($OnlyPlatform){
-      'Dreamcast' { return @('.gdi','.toc') -contains $ext }
-      'PS2'       { return @('.iso')        -contains $ext }
-      'PSX'       { return @('.cue')        -contains $ext }
-      'GC'        { return @('.gcm','.iso') -contains $ext }
+    if (@('.iso','.gcm') -contains $ext) {
+        return @('createdvd','-i', $InputPath, '-o', $OutputPath)
     }
-    return $true
-  }
-  function Get-CueTracks([string]$cuePath){
-    $dir = Split-Path -LiteralPath $cuePath -Parent
-    $list = @()
-    Get-Content -LiteralPath $cuePath | ForEach-Object {
-      $line = $_.Trim()
-      if ($line -match '^(?i)FILE\s+"([^"]+)"'){
-        $f = $Matches[1]
-        $full = Join-Path $dir $f
-        if (Test-Path -LiteralPath $full) { $list += $full }
-      }
-    }
-    return $list
-  }
-  function DestDir([string]$srcDir){
-    $rom = (Resolve-Path -LiteralPath $RomDir).Path
-    $out = (Resolve-Path -LiteralPath $OutDir).Path
-    $src = (Resolve-Path -LiteralPath $srcDir).Path
-    if ($src -eq $rom) { return $out }
-    if ($src.StartsWith($rom, [System.StringComparison]::OrdinalIgnoreCase)){
-      $rel = $src.Substring($rom.Length).TrimStart('\','/')
-      return (Join-Path $out $rel)
-    }
-    return $out
-  }
 
-  $f = $_.FullName
-  if (-not (Accept-ByPlatform $f)){
-    $name = $_.BaseName
-    $logf = Join-Path $LogDir ("{0}.log" -f $name)
-    "Title: $name`nSource: $f`n" | Set-Content -LiteralPath $logf
-    LogLine $logf "SKIP: filtered by --OnlyPlatform"
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='SKIP'})
-    return
-  }
+    return $null
+}
 
-  $name = $_.BaseName
-  $logf = Join-Path $LogDir ("{0}.log" -f $name)
-  "Title: $name`nSource: $f`n" | Set-Content -LiteralPath $logf
+function New-TempFilePath {
+    # PowerShell 5.1-friendly temp file creator
+    $tmp = [IO.Path]::GetTempFileName()
+    return $tmp
+}
 
-  $destDir = DestDir $_.DirectoryName
-  if ($DryRun){
-    Add-Content -LiteralPath $logf -Value ("[{0}] DRYRUN: ensure out dir {1}" -f (Timestamp), $destDir)
-  } else {
-    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-  }
+function Invoke-External {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$LogContext = ''
+    )
+    $stdout = New-TempFilePath
+    $stderr = New-TempFilePath
 
-  $outChd = Join-Path $destDir ("{0}.chd" -f $name)
-  if ((Test-Path -LiteralPath $outChd) -and (-not $Force)){
-    LogLine $logf "SKIP: CHD exists: $outChd"
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='EXIST'})
-    return
-  }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FilePath
+        # Quote args with whitespace
+        $psi.Arguments = [string]::Join(' ', ($Arguments | ForEach-Object {
+            if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
+        }))
+        $psi.RedirectStandardError = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
 
-  $ext = $_.Extension.ToLowerInvariant()
-  if ($ext -in @('.cue','.gdi','.toc')){
-    if ($DryRun){
-      LogLine $logf "DRYRUN: chdman createcd -i `"$f`" -o `"$outChd`""
-      [void]$Results.Add([pscustomobject]@{Title=$name; Status='WOULD'})
-      return
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+
+        [void]$proc.Start()
+        $out = $proc.StandardOutput.ReadToEnd()
+        $err = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+
+        Set-Content -LiteralPath $stdout -Value $out
+        Set-Content -LiteralPath $stderr -Value $err
+
+        if ($proc.ExitCode -ne 0) {
+            Write-Log -Level 'ERROR' -Context $LogContext -Message ("ExitCode={0}`nSTDOUT:`n{1}`nSTDERR:`n{2}" -f $proc.ExitCode, $out, $err)
+            return @{ Success=$false; ExitCode=$proc.ExitCode; StdOut=$out; StdErr=$err }
+        }
+
+        if ($out) { Write-Log -Level 'INFO' -Context $LogContext -Message $out.Trim() }
+        if ($err) { Write-Log -Level 'WARN' -Context $LogContext -Message $err.Trim() }
+
+        return @{ Success=$true; ExitCode=$proc.ExitCode; StdOut=$out; StdErr=$err }
     }
-    $force = @(); if ($Force){ $force = @('-f') }
-    $args = @('createcd') + $force + @('-i',$f,'-o',$outChd)
-    $rc = (Start-Process -FilePath $Chdman -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput $logf -RedirectStandardError $logf).ExitCode
-    if ($rc -eq 0){
-      $tracks = if ($ext -eq '.cue'){ Get-CueTracks $f } else { @() }
-      if (Test-Path -LiteralPath $outChd -PathType Leaf){
-        foreach($s in @($f) + $tracks){ Remove-Item -LiteralPath $s -Force -ErrorAction SilentlyContinue }
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='OK'})
-      } else {
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
-      }
-    } else {
-      [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
+    catch {
+        $eMsg = $_.Exception.Message
+        $eSrc = if ($_.Exception) { $_.Exception.Source } else { $null }
+        Write-Log -Level 'ERROR' -Context $LogContext -Message "Failed to run '$FilePath': $eMsg (Source=$eSrc)"
+        return @{ Success=$false; ExitCode=-1; StdOut=''; StdErr=$eMsg }
     }
-  }
-  elseif ($ext -in @('.iso','.gcm')){
-    if ($DryRun){
-      LogLine $logf "DRYRUN: chdman createdvd -i `"$f`" -o `"$outChd`""
-      [void]$Results.Add([pscustomobject]@{Title=$name; Status='WOULD'})
-      return
+    finally {
+        # Remove temp files
+        Remove-Item -LiteralPath $stdout,$stderr -ErrorAction SilentlyContinue
     }
-    $force = @(); if ($Force){ $force = @('-f') }
-    $args = @('createdvd') + $force + @('-i',$f,'-o',$outChd)
-    $rc = (Start-Process -FilePath $Chdman -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput $logf -RedirectStandardError $logf).ExitCode
-    if ($rc -eq 0){
-      if (Test-Path -LiteralPath $outChd -PathType Leaf){
-        Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='OK'})
-      } else {
-        [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
-      }
-    } else {
-      [void]$Results.Add([pscustomobject]@{Title=$name; Status='FAIL'})
-    }
-  }
-  elseif ($ext -eq '.cdi'){
-    LogLine $logf "WARN: .cdi not supported by chdman; convert to GDI or CUE/BIN first."
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='WARN_CDI'})
-  }
-  else{
-    LogLine $logf "Unsupported image type: $ext"
-    [void]$Results.Add([pscustomobject]@{Title=$name; Status='SKIP'})
-  }
-} -ThrottleLimit $Jobs -ArgumentList $Chdman,$RomDir,$OutDir,$LogDir,$DryRun.IsPresent,$Force.IsPresent,$OnlyPlatform,$Results
+}
 
-# Summary
-$groups = $Results | Group-Object -Property Status
-$total = ($Results | Measure-Object).Count
-Write-Host ""
-Write-Info "Summary:"
-Write-Host ("  Total items: {0}" -f $total)
-foreach($k in @('OK','FAIL','SKIP','EXIST','WARN_CDI','WOULD')){
-  $n = ($groups | Where-Object Name -EQ $k | Select-Object -ExpandProperty Count -ErrorAction SilentlyContinue)
-  if (-not $n) { $n = 0 }
-  Write-Host ("    {0,-10} {1}" -f ($k+':'), $n)
+function Expand-SevenZipArchive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$DestinationDir
+    )
+    Confirm-Directory $DestinationDir
+    $ctx = "7z: $(Split-Path -Path $ArchivePath -Leaf)"
+    $sevenZipArgs = @('x', '-y', '-o' + $DestinationDir, $ArchivePath)
+
+    if (-not (Test-Path -LiteralPath $SevenZipPath)) {
+        throw "7-Zip CLI not found: '$SevenZipPath'"
+    }
+
+    $res = Invoke-External -FilePath $SevenZipPath -Arguments $sevenZipArgs -LogContext $ctx
+    return $res.Success
+}
+
+# -------------------------
+# Begin
+# -------------------------
+
+try {
+    Confirm-Directory $SourceDir
+    Confirm-Directory $OutputDir
+    Confirm-Directory $LogDir
+
+    Write-Log "Starting scan. Source='$SourceDir' Output='$OutputDir' Platform='$Platform' Recurse=$($Recurse.IsPresent) Force=$($Force.IsPresent) MaxParallel=$MaxParallel"
+
+    # 1) Extract *.7z into same folder
+    $archiveQuery = @{
+        LiteralPath = $SourceDir
+        File        = $true
+        Include     = @('*.7z')
+        ErrorAction = 'SilentlyContinue'
+    }
+    if ($Recurse) { $archiveQuery.Recurse = $true }
+    $archives = Get-ChildItem @archiveQuery
+
+    foreach ($a in $archives) {
+        $dest = $a.DirectoryName
+        Write-Log -Message "Extracting archive: $($a.FullName) -> $dest"
+        $ok = $false
+        try {
+            $ok = Expand-SevenZipArchive -ArchivePath $a.FullName -DestinationDir $dest
+        }
+        catch {
+            $msg = $_.Exception.Message
+            $src = if ($_.Exception) { $_.Exception.Source } else { $null }
+            Write-Log -Level 'ERROR' -Message "Extraction failed for '$($a.FullName)': $msg (Source=$src)"
+        }
+
+        if ($ok -and -not $KeepArchives) {
+            try {
+                Remove-Item -LiteralPath $a.FullName -Force
+                Write-Log "Deleted archive: $($a.FullName)"
+            }
+            catch {
+                Write-Log -Level 'WARN' -Message "Could not delete archive '$($a.FullName)': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # 2) Find candidate images
+    $imgQuery = @{
+        LiteralPath = $SourceDir
+        File        = $true
+        Include     = @('*.cue','*.gdi','*.toc','*.iso','*.gcm')
+        ErrorAction = 'SilentlyContinue'
+    }
+    if ($Recurse) { $imgQuery.Recurse = $true }
+    $files = Get-ChildItem @imgQuery
+
+    # Filter by platform intent
+    $candidates = $files | Where-Object { Test-PlatformMatch -Path $_.FullName -Platform $Platform }
+
+    if (-not $candidates) {
+        Write-Log -Level 'WARN' -Message "No matching disc images found for Platform='$Platform'."
+        return
+    }
+
+    Write-Log "Found $($candidates.Count) candidate image(s). Beginning conversion…"
+
+    # Parallel gate
+    $sem = New-Object System.Threading.SemaphoreSlim($MaxParallel, $MaxParallel)
+    $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task]
+
+    foreach ($f in $candidates) {
+        # capture per-iteration values
+        $inPathCaptured = $f.FullName
+        $null = $sem.Wait()
+        $task = [Threading.Tasks.Task]::Run({
+            try {
+                $inPath = $inPathCaptured
+                $ctx = "CHDMAN: " + (Split-Path -Path $inPath -Leaf)
+
+                # For CD-based sets, ensure we feed descriptor (cue/gdi/toc) to chdman
+                $inputForChd = $inPath
+                $ext = [IO.Path]::GetExtension($inPath).ToLowerInvariant()
+                if (@('.bin') -contains $ext) {
+                    $desc = Get-PrimaryDescriptorPath -AnyPathInSet $inPath
+                    if ($null -ne $desc) { $inputForChd = $desc }
+                } elseif (@('.cue','.gdi','.toc') -notcontains $ext) {
+                    # If it's not a descriptor and not ISO/GCM, try to find a descriptor neighbor
+                    $desc = Get-PrimaryDescriptorPath -AnyPathInSet $inPath
+                    if ($null -ne $desc) { $inputForChd = $desc }
+                }
+
+                $outPath = Get-ChdOutputPath -InputPath $inputForChd -OutputRoot $OutputDir
+                if ((Test-Path -LiteralPath $outPath) -and (-not $Force)) {
+                    Write-Log -Level 'WARN' -Context $ctx -Message "Output exists, skipping: $outPath (use -Force to overwrite)"
+                    return
+                }
+
+                $argsForChd = Get-ChdmanArgs -InputPath $inputForChd -OutputPath $outPath
+                if ($null -eq $argsForChd) {
+                    Write-Log -Level 'WARN' -Context $ctx -Message "Unsupported input type for '$inputForChd' — skipping."
+                    return
+                }
+
+                if (-not (Test-Path -LiteralPath $ChdmanPath)) {
+                    Write-Log -Level 'ERROR' -Context $ctx -Message "chdman not found: '$ChdmanPath'"
+                    return
+                }
+
+                Write-Log -Context $ctx -Message ("Converting -> {0}" -f $outPath)
+                $res = Invoke-External -FilePath $ChdmanPath -Arguments $argsForChd -LogContext $ctx
+                if (-not $res.Success) { return }
+
+                # Post-conversion cleanup
+                if (-not $KeepImages) {
+                    try {
+                        $toRemove = @()
+
+                        switch -Regex ([regex]::Escape([IO.Path]::GetExtension($inputForChd).ToLowerInvariant())) {
+                            '\.cue' {
+                                $dir = Split-Path -Path $inputForChd -Parent
+                                $base = [IO.Path]::GetFileNameWithoutExtension($inputForChd)
+                                $toRemove += $inputForChd
+                                $toRemove += Get-ChildItem -LiteralPath $dir -File -Filter "$base*.bin" -ErrorAction SilentlyContinue | ForEach-Object FullName
+                            }
+                            '\.gdi' {
+                                $dir = Split-Path -Path $inputForChd -Parent
+                                $base = [IO.Path]::GetFileNameWithoutExtension($inputForChd)
+                                $toRemove += $inputForChd
+                                $toRemove += Get-ChildItem -LiteralPath $dir -File -Filter "$base*.bin" -ErrorAction SilentlyContinue | ForEach-Object FullName
+                            }
+                            '\.toc' {
+                                $dir = Split-Path -Path $inputForChd -Parent
+                                $base = [IO.Path]::GetFileNameWithoutExtension($inputForChd)
+                                $toRemove += $inputForChd
+                                $toRemove += Get-ChildItem -LiteralPath $dir -File -Filter "$base*.bin" -ErrorAction SilentlyContinue | ForEach-Object FullName
+                            }
+                            '\.iso' { $toRemove += $inputForChd }
+                            '\.gcm' { $toRemove += $inputForChd }
+                            default { $toRemove += $inputForChd }
+                        }
+
+                        $toRemove = $toRemove | Sort-Object -Unique
+                        foreach ($p in $toRemove) {
+                            if (Test-Path -LiteralPath $p) {
+                                Remove-Item -LiteralPath $p -Force
+                                Write-Log -Context $ctx -Message "Deleted source: $p"
+                            }
+                        }
+                    }
+                    catch {
+                        Write-Log -Level 'WARN' -Context $ctx -Message "Post-conversion cleanup failed: $($_.Exception.Message)"
+                    }
+                }
+            }
+            finally {
+                $sem.Release() | Out-Null
+            }
+        })
+        $tasks.Add($task) | Out-Null
+    }
+
+    if ($tasks.Count -gt 0) {
+        [Threading.Tasks.Task]::WaitAll($tasks.ToArray())
+    }
+    Write-Log "All done."
+}
+catch {
+    $msg = $_.Exception.Message
+    $src = if ($_.Exception) { $_.Exception.Source } else { $null }
+    Write-Log -Level 'ERROR' -Message "Fatal error: $msg (Source=$src)"
+    throw
 }
